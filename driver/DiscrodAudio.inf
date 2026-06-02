@@ -1,0 +1,122 @@
+;
+; DiscrodAudio.inf -- Discrod Virtual Audio Cable
+;
+; Installs a software-only (root-enumerated) audio device that exposes a paired
+; render endpoint ("Speakers") and capture endpoint ("Microphone").  Audio sent
+; to the speaker side is looped back to the microphone side, so it can be used
+; as a virtual mic in Discord and other apps.
+;
+; NOTE: replace the placeholder GUIDs in guids.h / below before shipping, and
+; sign the resulting catalog. See docs/BUILD.md.
+;
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = MEDIA
+ClassGuid   = {4d36e96c-e325-11ce-bfc1-08002be10318}
+Provider    = %ProviderName%
+CatalogFile = DiscrodAudio.cat
+DriverVer   = ; set by stampinf during build
+PnpLockdown = 1
+
+[Manufacturer]
+%MfgName% = DiscrodAudio,NT$ARCH$.10.0...16299
+
+; Root-enumerated software device (no physical hardware).
+[DiscrodAudio.NT$ARCH$.10.0...16299]
+%Discrod.DeviceDesc% = DiscrodAudio_Install, root\DiscrodAudio
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+DiscrodAudio.sys = 1
+
+[DestinationDirs]
+DefaultDestDir = 13   ; DIRID_DRIVERS (driver store package directory)
+
+; ============================ Install =======================================
+[DiscrodAudio_Install.NT]
+Include   = ks.inf, wdmaudio.inf
+Needs     = KS.Registration, WDMAUDIO.Registration
+CopyFiles = DiscrodAudio.CopyList
+AddReg    = DiscrodAudio.AddReg
+
+[DiscrodAudio.CopyList]
+DiscrodAudio.sys
+
+[DiscrodAudio_Install.NT.Services]
+AddService = DiscrodAudio, 0x00000002, DiscrodAudio_Service
+
+[DiscrodAudio_Service]
+DisplayName   = %Discrod.DeviceDesc%
+ServiceType   = 1       ; SERVICE_KERNEL_DRIVER
+StartType     = 3       ; SERVICE_DEMAND_START
+ErrorControl  = 1       ; SERVICE_ERROR_NORMAL
+ServiceBinary = %13%\DiscrodAudio.sys
+
+; --------------------- Interface registration -------------------------------
+; Each subdevice reference string (see common.h) is registered as a KS audio
+; interface so the endpoints surface in the Windows audio system.
+[DiscrodAudio_Install.NT.Interfaces]
+AddInterface = %KSCATEGORY_AUDIO%,  %DiscrodRenderWave%,  DiscrodRender.Wave
+AddInterface = %KSCATEGORY_RENDER%, %DiscrodRenderWave%,  DiscrodRender.Wave
+AddInterface = %KSCATEGORY_AUDIO%,  %DiscrodRenderTopo%,  DiscrodRender.Topo
+AddInterface = %KSCATEGORY_TOPOLOGY%,%DiscrodRenderTopo%, DiscrodRender.Topo
+AddInterface = %KSCATEGORY_AUDIO%,  %DiscrodCaptureWave%, DiscrodCapture.Wave
+AddInterface = %KSCATEGORY_CAPTURE%,%DiscrodCaptureWave%, DiscrodCapture.Wave
+AddInterface = %KSCATEGORY_AUDIO%,  %DiscrodCaptureTopo%, DiscrodCapture.Topo
+AddInterface = %KSCATEGORY_TOPOLOGY%,%DiscrodCaptureTopo%,DiscrodCapture.Topo
+
+[DiscrodRender.Wave]
+AddReg = DiscrodRender.Wave.AddReg
+[DiscrodRender.Wave.AddReg]
+HKR,,FriendlyName,,%Discrod.Render.Wave%
+HKR,,CLSID,,%Proxy.CLSID%
+
+[DiscrodRender.Topo]
+AddReg = DiscrodRender.Topo.AddReg
+[DiscrodRender.Topo.AddReg]
+HKR,,FriendlyName,,%Discrod.Render.Topo%
+HKR,,CLSID,,%Proxy.CLSID%
+
+[DiscrodCapture.Wave]
+AddReg = DiscrodCapture.Wave.AddReg
+[DiscrodCapture.Wave.AddReg]
+HKR,,FriendlyName,,%Discrod.Capture.Wave%
+HKR,,CLSID,,%Proxy.CLSID%
+
+[DiscrodCapture.Topo]
+AddReg = DiscrodCapture.Topo.AddReg
+[DiscrodCapture.Topo.AddReg]
+HKR,,FriendlyName,,%Discrod.Capture.Topo%
+HKR,,CLSID,,%Proxy.CLSID%
+
+[DiscrodAudio.AddReg]
+HKR,,AssociatedFilters,,"wdmaud,swmidi,redbook"
+HKR,,Driver,,DiscrodAudio.sys
+
+; ============================ Strings =======================================
+[Strings]
+ProviderName        = "Discrod"
+MfgName             = "Discrod"
+DiskName            = "Discrod Virtual Audio Installation Disk"
+Discrod.DeviceDesc  = "Discrod Virtual Cable"
+Discrod.Render.Wave = "Discrod Virtual Cable (Speakers)"
+Discrod.Render.Topo = "Discrod Virtual Cable Render Topology"
+Discrod.Capture.Wave= "Discrod Virtual Cable (Microphone)"
+Discrod.Capture.Topo= "Discrod Virtual Cable Capture Topology"
+
+Proxy.CLSID         = "{17CCA71B-ECD7-11D0-B908-00A0C9223196}"   ; KS proxy
+
+; KS category GUIDs.
+KSCATEGORY_AUDIO    = "{6994AD04-93EF-11D0-A3CC-00A0C9223196}"
+KSCATEGORY_RENDER   = "{65E8773E-8F56-11D0-A3B9-00A0C9223196}"
+KSCATEGORY_CAPTURE  = "{65E8773D-8F56-11D0-A3B9-00A0C9223196}"
+KSCATEGORY_TOPOLOGY = "{DDA54A40-1E4C-11D1-A050-405705C10000}"
+
+; Subdevice reference strings (must match common.h).
+DiscrodRenderWave   = "DiscrodRenderWave"
+DiscrodRenderTopo   = "DiscrodRenderTopo"
+DiscrodCaptureWave  = "DiscrodCaptureWave"
+DiscrodCaptureTopo  = "DiscrodCaptureTopo"
