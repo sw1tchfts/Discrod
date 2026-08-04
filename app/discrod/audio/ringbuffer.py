@@ -49,6 +49,18 @@ class RingBuffer:
                 self._read = (self._read + drop) % self.capacity
                 self._count = self.capacity
 
+    @property
+    def available(self) -> int:
+        with self._lock:
+            return self._count
+
+    def drop(self, frames: int) -> None:
+        """Discard the oldest ``frames`` frames (used to bound drift latency)."""
+        with self._lock:
+            drop = min(frames, self._count)
+            self._read = (self._read + drop) % self.capacity
+            self._count -= drop
+
     def read(self, frames: int) -> np.ndarray:
         """Read ``frames`` frames; zero-fills underflow."""
         out = np.zeros((frames, self.channels), dtype=np.float32)

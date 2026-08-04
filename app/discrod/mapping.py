@@ -6,6 +6,8 @@ The :class:`PadBank` holds all mappings and is serialized into the app config.
 
 from __future__ import annotations
 
+import threading
+
 from dataclasses import dataclass, field, asdict
 
 from .audio.clip import Clip, MODE_ONESHOT
@@ -69,20 +71,51 @@ class Controller:
         self.engine = engine
         self.bank = bank
         self._clip_cache: dict[str, Clip] = {}
+        self._cache_lock = threading.Lock()
         # Track which voices were started by which note for gate note-off.
         self._note_keys: dict[int, object] = {}
         # Optional UI hook: called as fn(note, event) for visual feedback.
         self.on_event = None
+        # Optional UI hook: called as fn(note_or_None, message) when a clip
+        # fails to load.  May fire from a background preload thread.
+        self.on_error = None
 
     def _get_clip(self, path: str) -> Clip:
-        clip = self._clip_cache.get(path)
-        if clip is None:
-            clip = Clip.load(path, self.engine.sample_rate, self.engine.channels)
-            self._clip_cache[path] = clip
+        with self._cache_lock:
+            clip = self._clip_cache.get(path)
+            if clip is None:
+                clip = Clip.load(path, self.engine.sample_rate, self.engine.channels)
+                self._clip_cache[path] = clip
         return clip
 
     def invalidate_cache(self) -> None:
-        self._clip_cache.clear()
+        with self._cache_lock:
+            self._clip_cache.clear()
+
+    def preload_async(self) -> threading.Thread:
+        """Decode every mapped clip on a background thread.
+
+        Without this the first press of each pad decodes (and possibly
+        resamples) the file synchronously on the trigger path — a multi-minute
+        music clip stalls the GUI and misses the soundboard moment.  Load
+        failures are reported through :attr:`on_error` instead of leaving a
+        silently dead pad.
+        """
+        mappings = list(self.bank.mappings.values())
+
+        def work():
+            for m in mappings:
+                try:
+                    self._get_clip(m.clip_path)
+                except Exception as exc:
+                    if self.on_error:
+                        self.on_error(m.note,
+                                      f"Pad {m.note}: cannot load "
+                                      f"{m.clip_path}: {exc}")
+        thread = threading.Thread(target=work, daemon=True,
+                                  name="discrod-clip-preload")
+        thread.start()
+        return thread
 
     def handle_note(self, event: str, note: int, velocity: int, channel: int) -> None:
         mapping = self.bank.get(note)
@@ -93,7 +126,11 @@ class Controller:
         if event == NOTE_ON:
             try:
                 clip = self._get_clip(mapping.clip_path)
-            except Exception:
+            except Exception as exc:
+                if self.on_error:
+                    self.on_error(note,
+                                  f"Pad {note}: cannot load "
+                                  f"{mapping.clip_path}: {exc}")
                 return
             gain = 10.0 ** (mapping.gain_db / 20.0)
             key = ("note", note)

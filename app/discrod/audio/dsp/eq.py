@@ -59,10 +59,10 @@ class Equalizer(Processor):
     def process(self, block: np.ndarray) -> None:
         if not self.enabled:
             return
+        # Flat (0 dB) peak/shelf bands are exact identity filters, so always
+        # processing keeps their state warm — skipping them freezes stale state
+        # that injects a transient when the gain leaves 0 dB again.
         for band in self.bands:
-            # Skip flat peak/shelf bands as a cheap optimization.
-            if band.ftype in (LOW_SHELF, PEAK, HIGH_SHELF) and band.gain_db == 0.0:
-                continue
             band.process(block)
 
     def to_dict(self) -> dict:

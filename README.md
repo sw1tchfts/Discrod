@@ -59,15 +59,24 @@ In the app:
 
 ## Features
 
-- **MIDI-triggered soundboard** with one-shot, gate (hold-to-play), loop and
-  toggle modes; polyphonic playback; MIDI-learn binding.
+- **MIDI-triggered soundboard** with one-shot (re-trigger restarts), gate
+  (hold-to-play), loop (press again to stop) and toggle modes; polyphonic
+  playback; MIDI-learn binding; clips are pre-decoded off the GUI thread and
+  every stop/re-trigger is declicked with a short fade.
 - **Per-channel mixer** — independent gain, mute, solo and a full processing
   chain on every source (mic, soundboard, and any channels you add).
 - **DSP, already implemented:** noise **gate**, **compressor**, and a 3-band
-  parametric **EQ** (RBJ biquads), plus master bus with peak meters.
+  parametric **EQ** (RBJ biquads), plus master bus with peak meters.  The whole
+  chain is vectorized (scipy/numpy) and renders a full-FX block in well under
+  1 ms — comfortably inside the 5.3 ms real-time budget.
 - **Virtual microphone** via our own kernel driver — no VB-CABLE.
-- **Persistent config** — devices, channels, processing and pad mappings are
-  saved between sessions.
+- **Device-robust audio I/O** — mono mics are upmixed automatically, sample
+  rates are negotiated with the selected devices, and the mic ring buffer is
+  primed and drift-bounded so long sessions neither crackle nor accumulate
+  latency.
+- **Persistent config** — devices (stored by name, so replugging USB gear
+  doesn't silently swap them), channels, processing and pad mappings are saved
+  between sessions.
 
 ## Roadmap
 

@@ -81,8 +81,14 @@ class MidiInput:
         """Capture the next note-on and report its note number to ``callback``."""
         self.learn_callback = callback
 
+    def cancel_learn(self) -> None:
+        """Disarm a pending MIDI-learn.  A stale armed learn would otherwise
+        swallow the first pad press whenever the user next plays."""
+        self.learn_callback = None
+
     def close(self) -> None:
         self._stop.set()
+        self.learn_callback = None
         if self._port is not None:
             try:
                 self._port.close()

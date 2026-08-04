@@ -3,6 +3,12 @@
 Both use a peak detector with separate attack/release ballistics on a per-block
 basis, computing one gain coefficient per sample from the linked (max across
 channels) detector signal.  This keeps the stereo image stable.
+
+Implementation note: everything that can be vectorized (detector, dB
+conversions, gain application) runs as numpy array ops; only the inherently
+sequential envelope recursion runs as a loop, and that loop works on plain
+Python floats — numpy scalar ops per sample were measured to blow the
+real-time budget inside the audio callback.
 """
 
 from __future__ import annotations
@@ -53,21 +59,25 @@ class Gate(Processor):
         floor = db_to_linear(self.range_db)
         atk = _coeff(self.attack_ms, self.sample_rate)
         rel = _coeff(self.release_ms, self.sample_rate)
+        one_m_atk = 1.0 - atk
+        one_m_rel = 1.0 - rel
         hold_samples = int(self.sample_rate * self.hold_ms / 1000.0)
-        detector = np.max(np.abs(block), axis=1)
+        detector = np.max(np.abs(block), axis=1).tolist()
+        gains = np.empty(len(detector), dtype=np.float32)
         env = self._env
         hold = self._hold_count
-        for n in range(block.shape[0]):
-            target = 1.0 if detector[n] >= thr else floor
+        for n, level in enumerate(detector):
+            target = 1.0 if level >= thr else floor
             if target >= env:
                 hold = hold_samples
-                env = atk * env + (1 - atk) * target
+                env = atk * env + one_m_atk * target
             else:
                 if hold > 0:
                     hold -= 1
                 else:
-                    env = rel * env + (1 - rel) * target
-            block[n] *= env
+                    env = rel * env + one_m_rel * target
+            gains[n] = env
+        block *= gains[:, None]
         self._env = env
         self._hold_count = hold
 
@@ -88,9 +98,19 @@ class Gate(Processor):
 
 
 class Compressor(Processor):
-    """Feed-forward peak compressor with soft-ish knee and make-up gain."""
+    """Feed-forward peak compressor with soft-ish knee and make-up gain.
+
+    The level detector is clamped to ``threshold_db - DETECTOR_FLOOR_DB`` so the
+    envelope cannot free-fall toward -180 dB during speech pauses; without the
+    clamp the envelope needs tens of milliseconds to climb back above threshold
+    and every phrase onset passes uncompressed.
+    """
 
     name = "Compressor"
+
+    #: How far below threshold the detector may sink (dB).  Bounds the
+    #: re-engagement time after silence to a few milliseconds.
+    DETECTOR_FLOOR_DB = 20.0
 
     def __init__(self, sample_rate: int, threshold_db: float = -18.0,
                  ratio: float = 3.0, attack_ms: float = 10.0,
@@ -102,34 +122,39 @@ class Compressor(Processor):
         self.attack_ms = float(attack_ms)
         self.release_ms = float(release_ms)
         self.makeup_db = float(makeup_db)
-        self._env_db = -120.0  # smoothed level estimate in dB
+        self._env_db = self.threshold_db - self.DETECTOR_FLOOR_DB
 
     def reset(self) -> None:
-        self._env_db = -120.0
+        self._env_db = self.threshold_db - self.DETECTOR_FLOOR_DB
 
     def process(self, block: np.ndarray) -> None:
         if not self.enabled:
             return
         atk = _coeff(self.attack_ms, self.sample_rate)
         rel = _coeff(self.release_ms, self.sample_rate)
+        one_m_atk = 1.0 - atk
+        one_m_rel = 1.0 - rel
         makeup = db_to_linear(self.makeup_db)
         thr = self.threshold_db
+        floor_db = thr - self.DETECTOR_FLOOR_DB
         ratio = max(self.ratio, 1.0)
+        slope = 1.0 - 1.0 / ratio
         detector = np.max(np.abs(block), axis=1)
-        env_db = self._env_db
-        for n in range(block.shape[0]):
-            level_db = 20.0 * np.log10(detector[n] + 1e-9)
+        levels_db = 20.0 * np.log10(detector + 1e-9)
+        np.maximum(levels_db, floor_db, out=levels_db)
+        levels = levels_db.tolist()
+        gains_db = np.empty(len(levels), dtype=np.float64)
+        env_db = min(max(self._env_db, floor_db), 0.0)
+        for n, level_db in enumerate(levels):
             # Smooth the detector with attack/release ballistics.
             if level_db > env_db:
-                env_db = atk * env_db + (1 - atk) * level_db
+                env_db = atk * env_db + one_m_atk * level_db
             else:
-                env_db = rel * env_db + (1 - rel) * level_db
+                env_db = rel * env_db + one_m_rel * level_db
             over = env_db - thr
-            if over > 0:
-                gain_db = -over * (1.0 - 1.0 / ratio)
-            else:
-                gain_db = 0.0
-            block[n] *= db_to_linear(gain_db) * makeup
+            gains_db[n] = -over * slope if over > 0 else 0.0
+        gains = np.power(10.0, gains_db / 20.0) * makeup
+        block *= gains[:, None].astype(np.float32)
         self._env_db = env_db
 
     def to_dict(self) -> dict:

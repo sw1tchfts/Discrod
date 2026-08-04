@@ -41,12 +41,17 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.cfg.bank:
             self.bank.load_dict(self.cfg.bank)
         self.controller = Controller(self.engine, self.bank)
+        self.controller.on_error = self._on_clip_error
+        self.engine.on_sample_rate_changed = self._on_sample_rate_changed
         self.midi = MidiInput(self._on_midi)
 
         self._build_ui()
         self._populate_devices()
         self._reload_pad_table()
         self._build_mixer()
+        # Decode mapped clips up front so the first pad press never blocks the
+        # GUI thread on file I/O.
+        self.controller.preload_async()
 
         # Meter refresh timer.
         self._timer = QtCore.QTimer(self)
@@ -179,11 +184,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self._select_saved_devices()
 
     def _select_saved_devices(self):
+        # Audio devices are persisted by NAME: PortAudio indices shift whenever
+        # a device is plugged/unplugged or across reboots, so a saved index can
+        # silently select the wrong device.  Integer values are still accepted
+        # for configs written by older versions.
         def select(combo, value):
+            if value is None:
+                return
             for i in range(combo.count()):
-                if combo.itemData(i) == value:
+                if (combo.itemText(i) == value if isinstance(value, str)
+                        else combo.itemData(i) == value):
                     combo.setCurrentIndex(i)
                     return
+            self.statusBar().showMessage(
+                f"Saved device not found: {value}", 8000)
         select(self.input_combo, self.cfg.input_device)
         select(self.output_combo, self.cfg.output_device)
         select(self.midi_combo, self.cfg.midi_port)
@@ -245,6 +259,11 @@ class MainWindow(QtWidgets.QMainWindow):
         for ch in self.engine.channels_list:
             chan_combo.addItem(ch.name)
         chan_combo.setCurrentText(mapping.channel)
+        if chan_combo.currentText() != mapping.channel:
+            # Mapping referenced a channel that no longer exists (stale/edited
+            # config); rewrite it to what the row actually shows so the UI and
+            # the trigger path agree.
+            mapping.channel = chan_combo.currentText()
         chan_combo.currentTextChanged.connect(
             lambda v, n=mapping.note: self._update_mapping(n, channel=v))
         self.table.setCellWidget(row, 2, chan_combo)
@@ -288,24 +307,31 @@ class MainWindow(QtWidgets.QMainWindow):
                              channel=self.engine.channels_list[-1].name)
         self.bank.set(mapping)
         self._reload_pad_table()
+        self.controller.preload_async()
 
     def _learn_pad(self):
+        if self.midi.learn_callback is not None:
+            # Second click cancels — a stale armed learn would swallow the
+            # first pad press of the next session and silently rebind it.
+            self.midi.cancel_learn()
+            self.statusBar().showMessage("MIDI learn cancelled")
+            return
+        if self.midi.port_name is None:
+            port = self.midi_combo.currentData()
+            if not port:
+                self.statusBar().showMessage(
+                    "Select a MIDI port before using MIDI learn")
+                return
+            try:
+                self.midi.open(port)
+            except Exception as exc:
+                QtWidgets.QMessageBox.critical(self, "MIDI error", str(exc))
+                return
         path = self._choose_clip()
         if not path:
             return
-        self.statusBar().showMessage("MIDI learn: press a key on your controller…")
-
-        def bound(note):
-            mapping = PadMapping(note=note, clip_path=path,
-                                 channel=self.engine.channels_list[-1].name)
-            self.bank.set(mapping)
-            self._reload_pad_table()
-            self.statusBar().showMessage(f"Bound note {note} ({note_name(note)})")
-
-        if self.midi.port_name is None:
-            port = self.midi_combo.currentData()
-            if port:
-                self.midi.open(port)
+        self.statusBar().showMessage(
+            "MIDI learn: press a key on your controller… (click again to cancel)")
         self.midi.arm_learn(lambda n: QtCore.QMetaObject.invokeMethod(
             self, "_finish_learn", QtCore.Qt.QueuedConnection,
             QtCore.Q_ARG(int, n), QtCore.Q_ARG(str, path)))
@@ -316,6 +342,7 @@ class MainWindow(QtWidgets.QMainWindow):
                              channel=self.engine.channels_list[-1].name)
         self.bank.set(mapping)
         self._reload_pad_table()
+        self.controller.preload_async()
         self.statusBar().showMessage(f"Bound note {note} ({note_name(note)})")
 
     def _remove_pad(self):
@@ -330,8 +357,31 @@ class MainWindow(QtWidgets.QMainWindow):
         row = self.table.currentRow()
         if row < 0:
             return
+        if not self.engine.running:
+            self.statusBar().showMessage(
+                "Engine is stopped — press Start to hear pads", 5000)
+            return
         note = self.table.item(row, 0).data(QtCore.Qt.UserRole)
         self.controller.handle_note("note_on", note, 100, 0)
+
+    # --- engine/controller callbacks ---------------------------------------
+    def _on_clip_error(self, note, message):
+        # May fire from the preload thread; marshal to the GUI thread.
+        QtCore.QMetaObject.invokeMethod(
+            self, "_show_status", QtCore.Qt.QueuedConnection,
+            QtCore.Q_ARG(str, message))
+
+    @QtCore.Slot(str)
+    def _show_status(self, message):
+        self.statusBar().showMessage(message, 8000)
+
+    def _on_sample_rate_changed(self, sample_rate):
+        # Called from _toggle_engine (GUI thread) during device negotiation.
+        # Cached clips were decoded at the old rate and must be reloaded.
+        self.controller.invalidate_cache()
+        self.controller.preload_async()
+        self.statusBar().showMessage(
+            f"Devices negotiated {sample_rate} Hz — clips reloaded", 8000)
 
     # --- meters / lifecycle -------------------------------------------------
     def _refresh_meters(self):
@@ -348,8 +398,14 @@ class MainWindow(QtWidgets.QMainWindow):
     def closeEvent(self, event):
         self.midi.close()
         self.engine.stop()
-        self.cfg.input_device = self.input_combo.currentData()
-        self.cfg.output_device = self.output_combo.currentData()
+
+        def device_name(combo):
+            # "(none)"/"(default)" carry data None -> persist None; otherwise
+            # persist the stable device name, not the volatile PortAudio index.
+            return combo.currentText() if combo.currentData() is not None else None
+
+        self.cfg.input_device = device_name(self.input_combo)
+        self.cfg.output_device = device_name(self.output_combo)
         self.cfg.midi_port = self.midi_combo.currentData()
         self.cfg.engine = self.engine.to_dict()
         self.cfg.bank = self.bank.to_dict()
