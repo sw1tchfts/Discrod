@@ -25,6 +25,11 @@ driver/*.cer
 *.log
 .vs/
 
+# APO build output (CMake) and endpoint backups
+apo/build/
+apo/x64/
+*.reg
+
 # OS
 .DS_Store
 Thumbs.db

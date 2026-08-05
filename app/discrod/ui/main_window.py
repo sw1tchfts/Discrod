@@ -79,6 +79,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refresh_btn.setToolTip("Rescan devices")
         self.refresh_btn.clicked.connect(self._populate_devices)
         bar.addWidget(self.refresh_btn)
+        # Driver-free transport: when checked, Start routes through the capture
+        # APO (shared-memory bridge) onto the real mic instead of opening the
+        # virtual-cable output device.  The "Virtual mic out" selection is then
+        # unused (the APO injects into whatever mic Discord already listens to).
+        self.apo_check = QtWidgets.QCheckBox("APO (no driver)")
+        self.apo_check.setToolTip(
+            "Route processed mic + soundboard through the Discrod capture APO\n"
+            "on your real microphone — no virtual audio device required.\n"
+            "Requires the APO to be registered (see apo/APO.md).")
+        self.apo_check.toggled.connect(self._on_apo_toggled)
+        bar.addWidget(self.apo_check)
         self.start_btn = QtWidgets.QPushButton("Start")
         self.start_btn.setCheckable(True)
         self.start_btn.toggled.connect(self._toggle_engine)
@@ -236,27 +247,41 @@ class MainWindow(QtWidgets.QMainWindow):
         select_midi(self.midi_combo, self.cfg.midi_port)
 
     # --- engine -------------------------------------------------------------
+    def _on_apo_toggled(self, on):
+        # Output device is meaningless in APO mode (the APO injects into the
+        # real mic), so grey it out for clarity.  Ignored while running.
+        self.output_combo.setEnabled(not on)
+
     def _toggle_engine(self, on):
         if on:
             def device_index(combo):
                 data = combo.currentData()
                 return data[0] if data is not None else None
             try:
-                self.engine.start(
-                    input_device=device_index(self.input_combo),
-                    output_device=device_index(self.output_combo),
-                )
+                if self.apo_check.isChecked():
+                    self.engine.start_apo()
+                    status = ("Running (APO) — processed mic + soundboard "
+                              "injected on your real microphone")
+                else:
+                    self.engine.start(
+                        input_device=device_index(self.input_combo),
+                        output_device=device_index(self.output_combo),
+                    )
+                    status = "Running — routing to virtual mic"
                 port = self.midi_combo.currentData()
                 if port:
                     self.midi.open(port)
+                self.apo_check.setEnabled(False)
                 self.start_btn.setText("Stop")
-                self.statusBar().showMessage("Running — routing to virtual mic")
+                self.statusBar().showMessage(status)
             except Exception as exc:
                 self.start_btn.setChecked(False)
                 QtWidgets.QMessageBox.critical(self, "Engine error", str(exc))
         else:
             self.midi.close()
             self.engine.stop()
+            self.engine.stop_apo()
+            self.apo_check.setEnabled(True)
             self.start_btn.setText("Start")
             self.statusBar().showMessage("Stopped")
 
@@ -437,6 +462,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def closeEvent(self, event):
         self.midi.close()
         self.engine.stop()
+        self.engine.stop_apo()
 
         def device_value(combo):
             # "(none)"/"(default)" carry data None -> persist None; otherwise

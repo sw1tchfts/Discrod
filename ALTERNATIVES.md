@@ -38,6 +38,21 @@ comparable to or worse than the driver.  Every commercial competitor
 looked at this trade and shipped a **signed virtual device driver** instead —
 the architecture in `driver/` is the industry-standard one.
 
+### Update: the injection APO is now implemented as an experimental opt-in
+
+Because it is the *only* pure-software route that meets a hard "no driver"
+requirement, the injection APO is now built out under `apo/` — see
+`apo/APO.md`.  The trade-offs above are unchanged and still real (unsupported
+registration, `DisableProtectedAudioDG`, watchdog needed, an APO fault can drop
+system audio).  What the implementation adds is that the risky surface is now
+*small and debuggable*: the DSP + soundboard-mix core is portable C++ verified
+on every push (including sample-for-sample parity against the app's Python DSP),
+so only the thin Windows COM shell and the registry attach remain unproven — and
+both are fully reversible (`unregister-apo.ps1` restores the endpoint from a
+backup taken at registration).  The signed `driver/` is still the recommended
+default; the APO is the fallback for users who cannot or will not install a
+kernel driver.
+
 ## Piggybacking an already-signed virtual device
 
 The app can output into *any* render endpoint, so any signed loopback pair on
