@@ -15,17 +15,35 @@
     Run from an ELEVATED PowerShell on the test machine. Production/distribution
     signing (EV cert + Microsoft attestation) is out of scope — see DEPLOY.md.
 
+    !! ANTI-CHEAT WARNING !!
+    This dev install turns on test-signing boot mode and requires Secure Boot
+    to be off. Vanguard-protected games REFUSE TO LAUNCH in that state
+    (VAN9001/VAN9003) until it is reverted; Easy Anti-Cheat, BattlEye and
+    FACEIT are similarly hostile to test-signing (as of Aug 2026 - check the
+    vendor's support pages). It is a launch block, not a cheating ban. Revert
+    with uninstall-driver.ps1 -DisableTestSigning (then reboot) and re-enable
+    Secure Boot in firmware. When a kernel anti-cheat is detected this script
+    stops unless -AcknowledgeAntiCheatRisk is passed. On a gaming machine
+    prefer a signed transport - see ALTERNATIVES.md, and run
+    scripts\check-anticheat.ps1 for a status report.
+
 .PARAMETER Build
     Run msbuild first (requires a Developer PowerShell / vcvars environment).
 
 .PARAMETER Configuration
     Build configuration folder to install from. Default: Debug.
+
+.PARAMETER AcknowledgeAntiCheatRisk
+    Proceed even though a kernel anti-cheat (Riot Vanguard, Easy Anti-Cheat,
+    BattlEye, FACEIT) was detected. Vanguard-protected games will refuse to
+    launch until the test-signing / Secure Boot state is reverted.
 #>
 [CmdletBinding()]
 param(
     [switch]$Build,
     [ValidateSet("Debug", "Release")]
-    [string]$Configuration = "Debug"
+    [string]$Configuration = "Debug",
+    [switch]$AcknowledgeAntiCheatRisk
 )
 
 $ErrorActionPreference = "Stop"
@@ -57,7 +75,63 @@ function Find-KitTool([string]$name) {
     return $null
 }
 
+function Test-AntiCheatPresent {
+    # Returns the names of kernel anti-cheat products found on this machine
+    # (empty when none). Best-effort: known Windows services plus the Riot
+    # Vanguard install folder. Keep in sync with scripts\check-anticheat.ps1.
+    $services = @{
+        "vgc"               = "Riot Vanguard"
+        "vgk"               = "Riot Vanguard"
+        "EasyAntiCheat"     = "Easy Anti-Cheat"
+        "EasyAntiCheat_EOS" = "Easy Anti-Cheat"
+        "BEService"         = "BattlEye"
+        "FACEIT"            = "FACEIT Anti-Cheat"
+    }
+    $found = @()
+    foreach ($name in $services.Keys) {
+        if (Get-Service -Name $name -ErrorAction SilentlyContinue) {
+            $found += $services[$name]
+        }
+    }
+    if (Test-Path "$env:SystemDrive\Program Files\Riot Vanguard") {
+        $found += "Riot Vanguard"
+    }
+    return ($found | Sort-Object -Unique)
+}
+
 Assert-Admin
+
+# --- anti-cheat guard --------------------------------------------------------
+# Runs before anything is built, trusted, signed, or installed. If test-signing
+# is already active the damage is done, so warn instead of blocking.
+$antiCheats = @(Test-AntiCheatPresent)
+if ($antiCheats.Count -gt 0) {
+    $bcdNow = bcdedit /enum "{current}" | Out-String
+    if ($bcdNow -match "testsigning\s+Yes") {
+        Write-Warning ("Kernel anti-cheat detected (" + ($antiCheats -join ", ") + ") and " +
+            "test-signing is ALREADY on: Vanguard-protected games refuse to launch " +
+            "(VAN9001/VAN9003) until you revert - uninstall-driver.ps1 -DisableTestSigning, " +
+            "reboot, and re-enable Secure Boot in firmware. Continuing.")
+    } elseif (-not $AcknowledgeAntiCheatRisk) {
+        throw (
+            "Kernel anti-cheat detected: " + ($antiCheats -join ", ") + ". This dev " +
+            "install enables test-signing boot mode (and needs Secure Boot off), and " +
+            "Vanguard-protected games will REFUSE TO LAUNCH (VAN9001/VAN9003) while the " +
+            "machine is in that state; Easy Anti-Cheat, BattlEye and FACEIT are similarly " +
+            "hostile to test-signing (as of Aug 2026 - check the vendor's support pages). " +
+            "This is a launch block, not a cheating ban. Revert path: " +
+            "uninstall-driver.ps1 -DisableTestSigning (then reboot) and re-enable Secure " +
+            "Boot in firmware. On a gaming machine use a signed transport instead - see " +
+            "ALTERNATIVES.md (zero system changes) and run scripts\check-anticheat.ps1 " +
+            "for a status report. Pass -AcknowledgeAntiCheatRisk to proceed anyway."
+        )
+    } else {
+        Write-Warning ("Kernel anti-cheat detected (" + ($antiCheats -join ", ") + ") - " +
+            "proceeding per -AcknowledgeAntiCheatRisk. Revert later with " +
+            "uninstall-driver.ps1 -DisableTestSigning (then reboot) and re-enable " +
+            "Secure Boot in firmware.")
+    }
+}
 
 if ($Build) {
     Write-Host "== Building driver ($Configuration|x64)" -ForegroundColor Cyan

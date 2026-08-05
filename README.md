@@ -106,3 +106,9 @@ cd driver/tests && g++ -std=c++17 test_loopbuffer.cpp -o t && ./t
   test-signed, and iterated on a Windows machine — see
   [`driver/docs/ARCHITECTURE.md`](driver/docs/ARCHITECTURE.md) for what is
   intentionally minimal in v1.
+- **Play games with kernel anti-cheat (Riot Vanguard, EAC, BattlEye)?** The
+  test-signed dev driver install makes Vanguard-protected games refuse to
+  launch (VAN9001/VAN9003) until reverted — read the *Anti-cheat
+  compatibility* section in [`DEPLOY.md`](DEPLOY.md) first, and prefer the
+  signed transports in [`ALTERNATIVES.md`](ALTERNATIVES.md) on a gaming
+  machine.

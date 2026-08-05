@@ -42,6 +42,58 @@ On the test machine:
    `bcdedit /set testsigning on` is blocked — disable Secure Boot first (you
    can re-enable it after switching to attestation-signed builds).
 
+## Anti-cheat compatibility (Vanguard, EasyAntiCheat, BattlEye)
+
+The dev install below puts the machine into **test-signing mode** and (if
+Secure Boot was on) leaves **Secure Boot disabled** — exactly the machine
+state kernel anti-cheat refuses to run on. As of Aug 2026:
+
+- **Riot Vanguard** (Valorant, League of Legends) refuses to launch while
+  test-signing is enabled, and on Windows 11 additionally requires Secure
+  Boot + TPM 2.0 — the well-known **VAN9001 / VAN9003** errors. This is a
+  **launch block / integrity refusal, not a cheating ban**: revert the
+  machine state and the games launch again.
+- **EasyAntiCheat, BattlEye, and FACEIT** are similarly hostile to
+  test-signing mode.
+
+None of this software touches game processes. A **properly signed** driver or
+APO is ordinary audio software (same category as VB-CABLE or NVIDIA
+Broadcast) and is not an anti-cheat concern — the risk is purely the
+unsigned-dev machine state the steps below create.
+
+**On a machine you game on**, skip the dev driver install entirely and use an
+already-signed transport from [`ALTERNATIVES.md`](ALTERNATIVES.md) (Steam
+Streaming Microphone, Elgato Wave Link, VB-CABLE): just select it as
+**Virtual mic out** in the app. No test mode, no Secure Boot change, no
+registry edits.
+
+**Preflight:** run `scripts\check-anticheat.ps1` (repo root) *before*
+installing — it detects Vanguard/EAC/BattlEye/FACEIT and reports the current
+test-signing / Secure Boot / protected-audio state — and again *after*
+reverting to confirm the machine is back to a state anti-cheat accepts. If
+anti-cheat is detected, `install-driver.ps1` (and the APO's
+`register-apo.ps1`) refuse to proceed unless you pass
+`-AcknowledgeAntiCheatRisk` — with two exceptions: `register-apo.ps1` skips
+the gate entirely when `-NoProtectedAudioOverride` is passed (a properly
+signed APO makes no risky change to gate), and `install-driver.ps1` only
+warns when test-signing is already enabled (that state exists whether or not
+the install continues).
+
+**Revert** (then reboot):
+
+```powershell
+# Driver path: remove the driver and restore signature enforcement
+powershell -ExecutionPolicy Bypass -File driver\scripts\uninstall-driver.ps1 -DisableTestSigning
+# ...then re-enable Secure Boot in UEFI firmware settings if you disabled it.
+
+# APO path (if used): detach, restore the endpoint, restore audiodg protection
+powershell -ExecutionPolicy Bypass -File apo\scripts\unregister-apo.ps1 -ReenableProtectedAudio
+```
+
+Anti-cheat vendors change enforcement over time — the claims above are dated
+Aug 2026, so check the vendor's current support pages (e.g. Riot's
+VAN9001/VAN9003 articles) rather than trusting this file to age well.
+
 ## 2. Build the driver
 
 From a *Developer PowerShell for VS 2022*:
@@ -146,6 +198,7 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-driver.ps1
 | **Crackling / dropouts** | Raise the app's block size in `%APPDATA%\Discrod\config.json` (`block_size`: 256 → 512), keep the app on WASAPI devices, and close other exclusive-mode audio apps. |
 | **BSOD** on driver load/start | Grab `C:\Windows\Minidump\*.dmp`, open in WinDbg (`!analyze -v`), and file the stack — the driver has never met real hardware, so a bring-up bug is possible. Test in a VM if you want zero risk to your main machine. |
 | Pads silent, status bar says a clip can't load | The mapped file moved or is an unsupported format — remap the pad. |
+| **Valorant/Vanguard shows VAN9001 or VAN9003** | The machine is still in the unsigned-dev state (test-signing on and/or Secure Boot off). Run `driver\scripts\uninstall-driver.ps1 -DisableTestSigning`, re-enable Secure Boot in UEFI firmware, reboot; if you used the APO path, also run `apo\scripts\unregister-apo.ps1 -ReenableProtectedAudio`. Confirm with `scripts\check-anticheat.ps1`. This is a launch block, not a ban — see *Anti-cheat compatibility* above. |
 
 ## Distributing to other people (later)
 

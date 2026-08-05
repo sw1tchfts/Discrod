@@ -67,6 +67,16 @@ the machine works as the cable with zero code changes:
 | Voicemod / NVIDIA Broadcast | ✗ | Their virtual mics accept no third-party injection (Broadcast also requires RTX hardware). |
 | Open-source signed cables | ✗ (none exist) | SAR unsigned/stale; Scream needs test mode on Win11 and is network-oriented; VAC trial watermarks audio; VirtualDrivers/Virtual-Audio-Driver publishes only test-signed betas (sells signed custom builds). |
 
+These signed options are also the **anti-cheat-safe** route: no test-signing
+mode, no Secure Boot changes, no `DisableProtectedAudioDG` downgrade — none of
+the machine states that make Riot Vanguard refuse to launch (VAN9001/VAN9003)
+or that EasyAntiCheat/BattlEye object to. That makes them the recommended
+transport on any machine running kernel anti-cheat (as of Aug 2026 — vendors
+change enforcement, so check their current guidance). The unsigned-dev installs
+of `driver/` and `apo/` are what create the problem; `DEPLOY.md`'s *Anti-cheat
+compatibility* section has the detection preflight (`scripts/check-anticheat.ps1`)
+and revert steps.
+
 ## No-driver approximations
 
 - **Hardware loopback** — an audio interface with a loopback channel

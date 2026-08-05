@@ -34,6 +34,13 @@
     you care about, sign the APO with a trusted certificate and leave protected
     audio enabled instead.
 
+    ANTI-CHEAT NOTE: DisableProtectedAudioDG's interaction with kernel
+    anti-cheat is not publicly documented (as of Aug 2026), so this script
+    refuses to set it when an anti-cheat (Riot Vanguard, Easy Anti-Cheat,
+    BattlEye, FACEIT) is detected, unless -AcknowledgeAntiCheatRisk is passed.
+    Run scripts\check-anticheat.ps1 for a status report; see ALTERNATIVES.md
+    for signed transports that need no system changes at all.
+
 .PARAMETER DllPath
     Path to DiscrodApo.dll. Defaults to a Release build next to this repo.
 
@@ -43,13 +50,19 @@
 
 .PARAMETER NoProtectedAudioOverride
     Skip setting DisableProtectedAudioDG (use when the DLL is properly signed).
+
+.PARAMETER AcknowledgeAntiCheatRisk
+    Set DisableProtectedAudioDG even though a kernel anti-cheat was detected
+    on this machine. Not needed with -NoProtectedAudioOverride (a properly
+    signed DLL requires no override, so nothing is gated).
 #>
 [CmdletBinding()]
 param(
     [string]$DllPath,
     [ValidateSet("Mode", "Endpoint")]
     [string]$Effect = "Mode",
-    [switch]$NoProtectedAudioOverride
+    [switch]$NoProtectedAudioOverride,
+    [switch]$AcknowledgeAntiCheatRisk
 )
 
 $ErrorActionPreference = "Stop"
@@ -101,8 +114,54 @@ function Get-EndpointName([string]$endpointKey) {
     return (Split-Path $endpointKey -Leaf)
 }
 
+function Test-AntiCheatPresent {
+    # Returns the names of kernel anti-cheat products found on this machine
+    # (empty when none). Best-effort: known Windows services plus the Riot
+    # Vanguard install folder. Keep in sync with scripts\check-anticheat.ps1.
+    $services = @{
+        "vgc"               = "Riot Vanguard"
+        "vgk"               = "Riot Vanguard"
+        "EasyAntiCheat"     = "Easy Anti-Cheat"
+        "EasyAntiCheat_EOS" = "Easy Anti-Cheat"
+        "BEService"         = "BattlEye"
+        "FACEIT"            = "FACEIT Anti-Cheat"
+    }
+    $found = @()
+    foreach ($name in $services.Keys) {
+        if (Get-Service -Name $name -ErrorAction SilentlyContinue) {
+            $found += $services[$name]
+        }
+    }
+    if (Test-Path "$env:SystemDrive\Program Files\Riot Vanguard") {
+        $found += "Riot Vanguard"
+    }
+    return ($found | Sort-Object -Unique)
+}
+
 Assert-Admin
 $dll = Resolve-Dll
+
+# --- anti-cheat guard --------------------------------------------------------
+# Gates ONLY the DisableProtectedAudioDG step below, but runs before regsvr32
+# so a refusal leaves no half-registered state. -NoProtectedAudioOverride
+# (properly signed DLL) is never gated.
+if (-not $NoProtectedAudioOverride -and -not $AcknowledgeAntiCheatRisk) {
+    $antiCheats = @(Test-AntiCheatPresent)
+    if ($antiCheats.Count -gt 0) {
+        throw (
+            "Kernel anti-cheat detected: " + ($antiCheats -join ", ") + ". " +
+            "This script is about to set DisableProtectedAudioDG=1, which lowers " +
+            "protection of the audiodg.exe protected process system-wide, and how " +
+            "anti-cheat products react to that state is not publicly documented " +
+            "(as of Aug 2026) - avoid it on a machine that runs kernel anti-cheat. " +
+            "Run scripts\check-anticheat.ps1 for a full status report; see " +
+            "ALTERNATIVES.md for signed transports that need none of this. To " +
+            "proceed anyway: pass -NoProtectedAudioOverride with a properly signed " +
+            "DLL (nothing gets gated), or -AcknowledgeAntiCheatRisk to accept the risk."
+        )
+    }
+}
+
 Write-Host "== Registering COM server: $dll" -ForegroundColor Cyan
 & regsvr32.exe /s $dll
 if ($LASTEXITCODE -ne 0) { throw "regsvr32 failed ($LASTEXITCODE)" }

@@ -83,6 +83,18 @@ DLL can load — this lowers `audiodg` protection **system-wide** and is meant f
 a dev/test machine. On a machine you care about, sign `DiscrodApo.dll` with a
 trusted code-signing certificate and pass `-NoProtectedAudioOverride`.
 
+> **Anti-cheat note (as of Aug 2026):** how kernel anti-cheat reacts to
+> `DisableProtectedAudioDG=1` is not publicly documented — treat it as
+> "avoid on a machine running Riot Vanguard, EasyAntiCheat, or BattlEye"
+> rather than a confirmed block. `register-apo.ps1` therefore refuses to run
+> when those are detected unless you pass `-AcknowledgeAntiCheatRisk`. A
+> properly signed APO installed with `-NoProtectedAudioOverride` never touches
+> the value and is ordinary audio software, not an anti-cheat concern. Check
+> your state with the repo-root `scripts\check-anticheat.ps1`, see the
+> *Anti-cheat compatibility* section in [`../DEPLOY.md`](../DEPLOY.md), and
+> consult your anti-cheat vendor's current guidance — enforcement changes over
+> time.
+
 ## Use
 
 1. Start the Discrod app, tick **APO (no driver)**, then **Start**. The app maps
