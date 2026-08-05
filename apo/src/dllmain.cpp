@@ -16,6 +16,10 @@
 #include <cstdio>
 #include <new>
 
+// This is the single translation unit that DEFINES the APO's GUIDs: <initguid.h>
+// must precede apo_guids.h here (and nowhere else) so the CLSID storage is
+// emitted exactly once across the whole DLL.
+#include <initguid.h>
 #include "apo_guids.h"
 #include "discrod_apo.h"
 

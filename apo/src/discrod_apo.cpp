@@ -5,6 +5,7 @@
 #include <ks.h>
 #include <ksmedia.h>
 #include <mmreg.h>
+#include <cstring>
 #include <new>
 #include <shlobj.h>
 
@@ -113,10 +114,16 @@ HRESULT DiscrodCaptureApo::ValidateFormat(IAudioMediaType* fmt,
     if (FAILED(hr) || wfx == nullptr) return APOERR_FORMAT_NOT_SUPPORTED;
 
     // Accept IEEE float (or the float subtype under WAVE_FORMAT_EXTENSIBLE).
+    // Compare the KS subtype's Data1 to the wave format tag rather than the
+    // KSDATAFORMAT_SUBTYPE_IEEE_FLOAT symbol: that GUID's storage is only
+    // emitted in a TU that defines INITGUID (or linked from ksuser/strmiids),
+    // and this DLL links neither — referencing it directly is an unresolved
+    // external.  The KSDATAFORMAT_SUBTYPE_* GUIDs encode the format tag in
+    // Data1 by construction, so this is exact, not a heuristic.
     bool isFloat = wfx->wFormatTag == WAVE_FORMAT_IEEE_FLOAT;
     if (wfx->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
         auto* ext = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(wfx);
-        isFloat = ext->SubFormat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+        isFloat = ext->SubFormat.Data1 == WAVE_FORMAT_IEEE_FLOAT;
     }
     if (!isFloat || wfx->wBitsPerSample != 32)
         return APOERR_FORMAT_NOT_SUPPORTED;
@@ -134,11 +141,18 @@ STDMETHODIMP DiscrodCaptureApo::IsInputFormatSupported(
     UNREFERENCED_PARAMETER(pOppositeFormat);
     if (pRequestedInputFormat == nullptr) return E_POINTER;
     HRESULT hr = ValidateFormat(pRequestedInputFormat, nullptr, nullptr);
-    if (ppSupportedInputFormat != nullptr) {
-        *ppSupportedInputFormat = SUCCEEDED(hr) ? pRequestedInputFormat : nullptr;
-        if (SUCCEEDED(hr)) pRequestedInputFormat->AddRef();
+    // We do not propose an alternative, so on failure return
+    // APOERR_FORMAT_NOT_SUPPORTED — never S_FALSE, which promises a suggested
+    // format in *ppSupportedInputFormat that the caller may dereference.
+    if (FAILED(hr)) {
+        if (ppSupportedInputFormat != nullptr) *ppSupportedInputFormat = nullptr;
+        return APOERR_FORMAT_NOT_SUPPORTED;
     }
-    return SUCCEEDED(hr) ? S_OK : S_FALSE;
+    if (ppSupportedInputFormat != nullptr) {
+        *ppSupportedInputFormat = pRequestedInputFormat;
+        pRequestedInputFormat->AddRef();
+    }
+    return S_OK;
 }
 
 STDMETHODIMP DiscrodCaptureApo::IsOutputFormatSupported(
@@ -147,11 +161,15 @@ STDMETHODIMP DiscrodCaptureApo::IsOutputFormatSupported(
     UNREFERENCED_PARAMETER(pOppositeFormat);
     if (pRequestedOutputFormat == nullptr) return E_POINTER;
     HRESULT hr = ValidateFormat(pRequestedOutputFormat, nullptr, nullptr);
-    if (ppSupportedOutputFormat != nullptr) {
-        *ppSupportedOutputFormat = SUCCEEDED(hr) ? pRequestedOutputFormat : nullptr;
-        if (SUCCEEDED(hr)) pRequestedOutputFormat->AddRef();
+    if (FAILED(hr)) {
+        if (ppSupportedOutputFormat != nullptr) *ppSupportedOutputFormat = nullptr;
+        return APOERR_FORMAT_NOT_SUPPORTED;
     }
-    return SUCCEEDED(hr) ? S_OK : S_FALSE;
+    if (ppSupportedOutputFormat != nullptr) {
+        *ppSupportedOutputFormat = pRequestedOutputFormat;
+        pRequestedOutputFormat->AddRef();
+    }
+    return S_OK;
 }
 
 STDMETHODIMP DiscrodCaptureApo::GetInputChannelCount(UINT32* pu32ChannelCount) {

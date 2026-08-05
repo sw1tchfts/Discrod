@@ -9,8 +9,14 @@
 
 #pragma once
 
-#include <initguid.h>
 #include <guiddef.h>
+
+// DEFINE_GUID here expands to a *declaration* (extern const GUID) in every
+// translation unit — EXCEPT the single one that includes <initguid.h> before
+// this header, where it expands to the definition.  That one definition site
+// is dllmain.cpp.  Do NOT include <initguid.h> from this header: it is pulled
+// into multiple TUs and would emit the CLSID storage in each, which is a
+// duplicate-symbol link error (LNK2005).
 
 // {7C9D5A24-6B3E-4C1F-9A2D-3E8F1B0C6A50}
 DEFINE_GUID(CLSID_DiscrodCaptureApo,

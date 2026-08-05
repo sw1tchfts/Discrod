@@ -19,7 +19,8 @@ if(WIN32)
         src/discrod_apo.cpp
         src/dllmain.cpp
         src/discrod_apo.def)
-    target_link_libraries(DiscrodApo PRIVATE discrod_apo_core ole32 shlwapi)
+    # ole32: CoTaskMemAlloc; shell32: SHGetFolderPathW; advapi32: Reg* APIs.
+    target_link_libraries(DiscrodApo PRIVATE discrod_apo_core ole32 shell32 advapi32)
     set_target_properties(DiscrodApo PROPERTIES OUTPUT_NAME "DiscrodApo")
 endif()
 
