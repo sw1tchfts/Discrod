@@ -36,9 +36,11 @@ required.
 
 ## Quick start (app)
 
-> The driver must be built and installed separately on Windows — see
-> [`driver/docs/BUILD.md`](driver/docs/BUILD.md). The app runs without it, but
-> the virtual-mic routing needs the driver (or any output device) selected.
+> **Full deployment** (build + sign + install the driver, app setup, Discord
+> wiring, troubleshooting) is covered end-to-end in [`DEPLOY.md`](DEPLOY.md),
+> with install/uninstall scripts in `driver/scripts/`. The app also runs
+> without the driver — the virtual-mic routing just needs *some* output device
+> selected.
 
 ```bash
 cd app

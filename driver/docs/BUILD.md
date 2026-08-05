@@ -1,5 +1,11 @@
 # Building & installing the Discrod Virtual Audio Cable driver
 
+> **Scripted path:** `scripts\install-driver.ps1 -Build` automates everything
+> below (cert creation, signing, catalog, test-signing check, pnputil install,
+> device-node creation), and `scripts\uninstall-driver.ps1` reverses it. The
+> repo-root [`DEPLOY.md`](../../DEPLOY.md) is the end-to-end deployment guide;
+> this file remains the reference for the individual commands.
+
 > **Important:** this is a Windows **kernel-mode** driver. It can only be built
 > on Windows with the WDK, and it cannot be built or tested in the Linux CI
 > container used for the app. The loopback ring algorithm (the core of the
