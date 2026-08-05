@@ -6,8 +6,10 @@ Module Name:
 Abstract:
     Minimal topology miniport for the virtual cable endpoints.  The topology
     filter exposes the endpoint to the Windows audio system (so it shows up in
-    the Sound control panel and in Discord's device list) and carries the volume
-    node.  Render and capture each get a topology paired with their wave filter.
+    the Sound control panel and in Discord's device list).  Render and capture
+    each get a topology paired with their wave filter; v1 is a node-less
+    bridge-to-endpoint connection (the volume node is deliberately deferred,
+    see ARCHITECTURE.md).
 
 Environment:
     Kernel mode.
@@ -19,6 +21,15 @@ Environment:
 
 #include "common.h"
 
+// Topology filter pin IDs -- indices into the PCPIN_DESCRIPTOR tables in
+// mintopo.cpp.  Pin 0 bridges to the wave filter (the adapter registers the
+// physical connection); pin 1 is the endpoint "jack" (speaker or microphone).
+enum DISCROD_TOPO_PIN
+{
+    DiscrodTopoPinWaveBridge = 0,
+    DiscrodTopoPinEndpoint   = 1
+};
+
 class CMiniportTopology : public IMiniportTopology, public CUnknown
 {
 public:
@@ -26,8 +37,9 @@ public:
     CMiniportTopology(PUNKNOWN other, DISCROD_ROLE role);
     ~CMiniportTopology();
 
-    IMP_IMiniportTopology;   // Init, GetDescription, DataRangeIntersection
-    IMP_IMiniport;
+    // IMP_IMiniportTopology already expands IMP_IMiniport, so this single
+    // macro declares Init, GetDescription and DataRangeIntersection.
+    IMP_IMiniportTopology;
 
 private:
     DISCROD_ROLE m_role;

@@ -11,7 +11,16 @@ Abstract:
     Each stream allocates a cyclic "DMA" buffer that PortCls maps for the client,
     and a 10 ms periodic timer simulates the hardware DMA pointer.  On every tick
     we move one interval of audio between the client's DMA buffer and the shared
-    loopback ring, which couples the speaker and microphone endpoints.
+    loopback ring (which couples the speaker and microphone endpoints), then
+    signal the port's service group so PortCls performs the client<->DMA copies.
+
+    Paging policy (see also ARCHITECTURE.md):
+      - PAGE section: everything PortCls calls at PASSIVE_LEVEL only (Init,
+        GetDescription, DataRangeIntersection, NewStream, QI, SetFormat,
+        SetNotificationFreq, AllocateBuffer, FreeBuffer, ctors/dtors).
+      - default (non-paged) section: everything reachable at DISPATCH_LEVEL --
+        the timer DPC, ServiceLoopback, AdvancePosition, SetState, GetPosition,
+        NormalizePhysicalPosition, Silence, and all IDmaChannel accessors.
 
 Environment:
     Kernel mode.
@@ -21,10 +30,11 @@ Environment:
 #include "minwavecyclic.h"
 
 //=============================================================================
-// Format / data-range descriptors (PCM 48k/16/2).
+// Static descriptor tables (MSVAD-style).  These are data, not code, so they
+// are unaffected by #pragma code_seg; PortCls walks them at PASSIVE_LEVEL.
 //=============================================================================
-#pragma code_seg("PAGE")
 
+// The one PCM format of the cable (48 kHz / 16-bit / stereo).
 static KSDATARANGE_AUDIO PinDataRangesPCM =
 {
     {
@@ -48,12 +58,174 @@ static PKSDATARANGE PinDataRangePointers[] =
     PKSDATARANGE(&PinDataRangesPCM)
 };
 
+// Bridge pins carry no wave format -- analog "wire" to the topology filter.
+static KSDATARANGE PinDataRangesBridge[] =
+{
+    {
+        sizeof(KSDATARANGE),
+        0,
+        0,
+        0,
+        STATICGUIDOF(KSDATAFORMAT_TYPE_AUDIO),
+        STATICGUIDOF(KSDATAFORMAT_SUBTYPE_ANALOG),
+        STATICGUIDOF(KSDATAFORMAT_SPECIFIER_NONE)
+    }
+};
+
+static PKSDATARANGE PinDataRangePointersBridge[] =
+{
+    &PinDataRangesBridge[0]
+};
+
+//-----------------------------------------------------------------------------
+// Render wave filter: client renders into pin 0 (sink), audio leaves through
+// the bridge pin 1 toward the render topology (and, via the loopback ring,
+// toward the capture side).
+//-----------------------------------------------------------------------------
+static PCPIN_DESCRIPTOR RenderWavePins[] =
+{
+    // DiscrodWavePinStream: the system streaming pin (WaveOut sink).
+    {
+        1, 1, 0,                                // one instance: point-to-point
+        NULL,                                   // AutomationTable
+        {
+            0, NULL,                            // Interfaces
+            0, NULL,                            // Mediums
+            SIZEOF_ARRAY(PinDataRangePointers), // DataRangesCount
+            PinDataRangePointers,               // DataRanges
+            KSPIN_DATAFLOW_IN,                  // client pushes PCM in
+            KSPIN_COMMUNICATION_SINK,           // accepts connection IRPs
+            &KSCATEGORY_AUDIO,                  // Category
+            NULL,                               // Name
+            0                                   // Reserved
+        }
+    },
+    // DiscrodWavePinBridge: physical connection to the render topology.
+    {
+        0, 0, 0,                                // bridge pins take no instances
+        NULL,
+        {
+            0, NULL,
+            0, NULL,
+            SIZEOF_ARRAY(PinDataRangePointersBridge),
+            PinDataRangePointersBridge,
+            KSPIN_DATAFLOW_OUT,
+            KSPIN_COMMUNICATION_NONE,           // no IRPs on a bridge pin
+            &KSCATEGORY_AUDIO,
+            NULL,
+            0
+        }
+    }
+};
+
+// Node-less filter: the streaming pin feeds the bridge pin directly.
+static PCCONNECTION_DESCRIPTOR RenderWaveConnections[] =
+{
+    { PCFILTER_NODE, DiscrodWavePinStream, PCFILTER_NODE, DiscrodWavePinBridge }
+};
+
+static GUID RenderWaveCategories[] =
+{
+    { STATICGUIDOF(KSCATEGORY_AUDIO) },
+    { STATICGUIDOF(KSCATEGORY_RENDER) }
+};
+
+static PCFILTER_DESCRIPTOR RenderWaveFilterDescriptor =
+{
+    0,                                   // Version
+    NULL,                                // AutomationTable
+    sizeof(PCPIN_DESCRIPTOR),            // PinSize
+    SIZEOF_ARRAY(RenderWavePins),        // PinCount
+    RenderWavePins,                      // Pins
+    sizeof(PCNODE_DESCRIPTOR),           // NodeSize
+    0,                                   // NodeCount
+    NULL,                                // Nodes
+    SIZEOF_ARRAY(RenderWaveConnections), // ConnectionCount
+    RenderWaveConnections,               // Connections
+    SIZEOF_ARRAY(RenderWaveCategories),  // CategoryCount
+    RenderWaveCategories                 // Categories
+};
+
+//-----------------------------------------------------------------------------
+// Capture wave filter: audio arrives on bridge pin 1 (from the capture
+// topology / the loopback ring) and the client records from pin 0 (source
+// dataflow, IRP sink).
+//-----------------------------------------------------------------------------
+static PCPIN_DESCRIPTOR CaptureWavePins[] =
+{
+    // DiscrodWavePinStream: the system streaming pin (WaveIn).
+    {
+        1, 1, 0,
+        NULL,
+        {
+            0, NULL,
+            0, NULL,
+            SIZEOF_ARRAY(PinDataRangePointers),
+            PinDataRangePointers,
+            KSPIN_DATAFLOW_OUT,                 // client pulls PCM out
+            KSPIN_COMMUNICATION_SINK,           // still the IRP sink
+            &KSCATEGORY_AUDIO,
+            NULL,
+            0
+        }
+    },
+    // DiscrodWavePinBridge: physical connection from the capture topology.
+    {
+        0, 0, 0,
+        NULL,
+        {
+            0, NULL,
+            0, NULL,
+            SIZEOF_ARRAY(PinDataRangePointersBridge),
+            PinDataRangePointersBridge,
+            KSPIN_DATAFLOW_IN,
+            KSPIN_COMMUNICATION_NONE,
+            &KSCATEGORY_AUDIO,
+            NULL,
+            0
+        }
+    }
+};
+
+static PCCONNECTION_DESCRIPTOR CaptureWaveConnections[] =
+{
+    { PCFILTER_NODE, DiscrodWavePinBridge, PCFILTER_NODE, DiscrodWavePinStream }
+};
+
+static GUID CaptureWaveCategories[] =
+{
+    { STATICGUIDOF(KSCATEGORY_AUDIO) },
+    { STATICGUIDOF(KSCATEGORY_CAPTURE) }
+};
+
+static PCFILTER_DESCRIPTOR CaptureWaveFilterDescriptor =
+{
+    0,
+    NULL,
+    sizeof(PCPIN_DESCRIPTOR),
+    SIZEOF_ARRAY(CaptureWavePins),
+    CaptureWavePins,
+    sizeof(PCNODE_DESCRIPTOR),
+    0,
+    NULL,
+    SIZEOF_ARRAY(CaptureWaveConnections),
+    CaptureWaveConnections,
+    SIZEOF_ARRAY(CaptureWaveCategories),
+    CaptureWaveCategories
+};
+
+// DPC trampoline (defined in the non-paged section below; declared here so
+// stream Init can wire it into KeInitializeDpc).
+static void DmaTimerDpc(PKDPC dpc, PVOID context, PVOID a1, PVOID a2);
+
 //=============================================================================
-// CMiniportWaveCyclic
+// CMiniportWaveCyclic -- PASSIVE_LEVEL-only methods (pageable).
 //=============================================================================
+#pragma code_seg("PAGE")
+
 CMiniportWaveCyclic::CMiniportWaveCyclic(PUNKNOWN other, DISCROD_ROLE role)
-    : CUnknown(other), m_role(role), m_adapter(nullptr),
-      m_port(nullptr), m_streamAllocated(FALSE)
+    : CUnknown(other), m_role(role), m_port(nullptr),
+      m_serviceGroup(nullptr), m_streamAllocated(FALSE)
 {
     PAGED_CODE();
 }
@@ -61,6 +233,11 @@ CMiniportWaveCyclic::CMiniportWaveCyclic(PUNKNOWN other, DISCROD_ROLE role)
 CMiniportWaveCyclic::~CMiniportWaveCyclic()
 {
     PAGED_CODE();
+    if (m_serviceGroup)
+    {
+        m_serviceGroup->Release();
+        m_serviceGroup = nullptr;
+    }
     if (m_port)
     {
         m_port->Release();
@@ -69,14 +246,63 @@ CMiniportWaveCyclic::~CMiniportWaveCyclic()
 }
 
 STDMETHODIMP_(NTSTATUS)
+CMiniportWaveCyclic::NonDelegatingQueryInterface(REFIID interfaceId,
+                                                PVOID* object)
+{
+    PAGED_CODE();
+    ASSERT(object);
+
+    if (IsEqualGUIDAligned(interfaceId, IID_IUnknown))
+    {
+        *object = PVOID(PUNKNOWN(PMINIPORTWAVECYCLIC(this)));
+    }
+    else if (IsEqualGUIDAligned(interfaceId, IID_IMiniport))
+    {
+        *object = PVOID(PMINIPORT(this));
+    }
+    else if (IsEqualGUIDAligned(interfaceId, IID_IMiniportWaveCyclic))
+    {
+        *object = PVOID(PMINIPORTWAVECYCLIC(this));
+    }
+    else if (IsEqualGUIDAligned(interfaceId, IID_IPowerNotify))
+    {
+        *object = PVOID(PPOWERNOTIFY(this));
+    }
+    else
+    {
+        *object = nullptr;
+    }
+
+    if (*object)
+    {
+        // AddRef through the interface we are handing out (MSVAD pattern).
+        PUNKNOWN(*object)->AddRef();
+        return STATUS_SUCCESS;
+    }
+
+    return STATUS_INVALID_PARAMETER;
+}
+
+STDMETHODIMP_(NTSTATUS)
 CMiniportWaveCyclic::Init(PUNKNOWN unknownAdapter, PRESOURCELIST resourceList,
                          PPORTWAVECYCLIC port)
 {
     PAGED_CODE();
+    UNREFERENCED_PARAMETER(unknownAdapter);
     UNREFERENCED_PARAMETER(resourceList);
 
     m_port = port;
     m_port->AddRef();
+
+    // The service group is how the "virtual DMA" tells PortCls to service the
+    // stream: the timer DPC calls m_port->Notify(m_serviceGroup), which drives
+    // the port's client-buffer <-> DMA-buffer copies.  Without it no audio
+    // would ever move, even with the timer running.
+    NTSTATUS status = PcNewServiceGroup(&m_serviceGroup, nullptr);
+    if (!NT_SUCCESS(status))
+    {
+        return status;
+    }
 
     // The shared loopback ring is created once by the adapter in StartDevice.
     return GetLoopback() ? STATUS_SUCCESS : STATUS_DEVICE_NOT_READY;
@@ -86,10 +312,12 @@ STDMETHODIMP_(NTSTATUS)
 CMiniportWaveCyclic::GetDescription(PPCFILTER_DESCRIPTOR* outDescriptor)
 {
     PAGED_CODE();
-    // The full PCFILTER_DESCRIPTOR (pins/nodes/connections) for the render and
-    // capture filters is built in the descriptor tables compiled with the WDK
-    // (see ARCHITECTURE.md). One data range is shared by both roles.
     ASSERT(outDescriptor);
+
+    // One miniport class, two filter shapes: the role chosen at construction
+    // selects the render or capture descriptor table above.
+    *outDescriptor = (m_role == RoleCapture) ? &CaptureWaveFilterDescriptor
+                                             : &RenderWaveFilterDescriptor;
     return STATUS_SUCCESS;
 }
 
@@ -146,7 +374,12 @@ CMiniportWaveCyclic::NewStream(PMINIPORTWAVECYCLICSTREAM* outStream,
 {
     PAGED_CODE();
     UNREFERENCED_PARAMETER(poolType);
-    UNREFERENCED_PARAMETER(outServiceGroup);
+
+    if (pin != DiscrodWavePinStream)
+    {
+        // Only the streaming pin can be opened; the bridge pin carries no IRPs.
+        return STATUS_INVALID_PARAMETER;
+    }
 
     if (m_streamAllocated)
     {
@@ -173,6 +406,13 @@ CMiniportWaveCyclic::NewStream(PMINIPORTWAVECYCLICSTREAM* outStream,
     m_streamAllocated = TRUE;
     *outStream = static_cast<PMINIPORTWAVECYCLICSTREAM>(stream);
     *outDmaChannel = static_cast<PDMACHANNEL>(stream);
+
+    // Hand PortCls the service group our timer DPC notifies; PortCls only
+    // moves audio between the client buffer and our DMA buffer when this
+    // group is signalled (see ServiceLoopback).
+    *outServiceGroup = m_serviceGroup;
+    m_serviceGroup->AddRef();
+
     return STATUS_SUCCESS;
 }
 
@@ -183,8 +423,9 @@ STDMETHODIMP_(void) CMiniportWaveCyclic::PowerChangeNotify(POWER_STATE state)
 }
 
 //=============================================================================
-// CMiniportWaveCyclicStream
+// CMiniportWaveCyclicStream -- PASSIVE_LEVEL-only methods (pageable).
 //=============================================================================
+
 CMiniportWaveCyclicStream::CMiniportWaveCyclicStream(PUNKNOWN other)
     : CUnknown(other), m_miniport(nullptr), m_capture(FALSE),
       m_state(KSSTATE_STOP), m_dmaBuffer(nullptr), m_dmaBufferSize(0),
@@ -208,17 +449,37 @@ CMiniportWaveCyclicStream::~CMiniportWaveCyclicStream()
     }
 }
 
-// DPC trampoline: invoked every timer period to service the simulated DMA.
-static void DmaTimerDpc(PKDPC dpc, PVOID context, PVOID a1, PVOID a2)
+STDMETHODIMP_(NTSTATUS)
+CMiniportWaveCyclicStream::NonDelegatingQueryInterface(REFIID interfaceId,
+                                                       PVOID* object)
 {
-    UNREFERENCED_PARAMETER(dpc);
-    UNREFERENCED_PARAMETER(a1);
-    UNREFERENCED_PARAMETER(a2);
-    auto* stream = static_cast<CMiniportWaveCyclicStream*>(context);
-    if (stream)
+    PAGED_CODE();
+    ASSERT(object);
+
+    if (IsEqualGUIDAligned(interfaceId, IID_IUnknown))
     {
-        stream->ServiceLoopback();
+        *object = PVOID(PUNKNOWN(PMINIPORTWAVECYCLICSTREAM(this)));
     }
+    else if (IsEqualGUIDAligned(interfaceId, IID_IMiniportWaveCyclicStream))
+    {
+        *object = PVOID(PMINIPORTWAVECYCLICSTREAM(this));
+    }
+    else if (IsEqualGUIDAligned(interfaceId, IID_IDmaChannel))
+    {
+        *object = PVOID(PDMACHANNEL(this));
+    }
+    else
+    {
+        *object = nullptr;
+    }
+
+    if (*object)
+    {
+        PUNKNOWN(*object)->AddRef();
+        return STATUS_SUCCESS;
+    }
+
+    return STATUS_INVALID_PARAMETER;
 }
 
 NTSTATUS CMiniportWaveCyclicStream::Init(CMiniportWaveCyclic* miniport,
@@ -239,7 +500,27 @@ NTSTATUS CMiniportWaveCyclicStream::Init(CMiniportWaveCyclic* miniport,
     return STATUS_SUCCESS;
 }
 
-// --- IDmaChannel: PortCls allocates/maps the cyclic buffer through us --------
+STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclicStream::SetFormat(PKSDATAFORMAT format)
+{
+    PAGED_CODE();
+    UNREFERENCED_PARAMETER(format);
+    return STATUS_SUCCESS;   // single fixed format
+}
+
+STDMETHODIMP_(ULONG)
+CMiniportWaveCyclicStream::SetNotificationFreq(ULONG interval, PULONG frameSize)
+{
+    PAGED_CODE();
+    UNREFERENCED_PARAMETER(interval);
+
+    // The virtual DMA runs at a fixed 10 ms granularity regardless of the
+    // requested interval; report the actual interval back (per the
+    // IMiniportWaveCyclicStream contract this returns the interval in ms).
+    *frameSize = m_bytesPerInterval;
+    return DISCROD_NOTIFY_INTERVAL_MS;
+}
+
+// --- IDmaChannel: buffer setup/teardown runs at PASSIVE_LEVEL ---------------
 STDMETHODIMP_(NTSTATUS)
 CMiniportWaveCyclicStream::AllocateBuffer(ULONG bufferSize,
                                           PPHYSICAL_ADDRESS physAddr)
@@ -269,6 +550,27 @@ STDMETHODIMP_(void) CMiniportWaveCyclicStream::FreeBuffer()
     }
 }
 
+//=============================================================================
+// DISPATCH_LEVEL paths -- everything below here must be non-paged.  The timer
+// DPC lands here, and PortCls calls the position/copy/state entry points at
+// DISPATCH_LEVEL while the stream runs.
+//=============================================================================
+#pragma code_seg()
+
+// DPC trampoline: invoked every timer period to service the simulated DMA.
+static void DmaTimerDpc(PKDPC dpc, PVOID context, PVOID a1, PVOID a2)
+{
+    UNREFERENCED_PARAMETER(dpc);
+    UNREFERENCED_PARAMETER(a1);
+    UNREFERENCED_PARAMETER(a2);
+    auto* stream = static_cast<CMiniportWaveCyclicStream*>(context);
+    if (stream)
+    {
+        stream->ServiceLoopback();
+    }
+}
+
+// --- IDmaChannel accessors: PortCls uses these during service at DISPATCH ---
 STDMETHODIMP_(PVOID) CMiniportWaveCyclicStream::SystemAddress()
 {
     return m_dmaBuffer;
@@ -304,6 +606,12 @@ STDMETHODIMP_(PHYSICAL_ADDRESS) CMiniportWaveCyclicStream::PhysicalAddress()
     PHYSICAL_ADDRESS pa;
     pa.QuadPart = 0;   // virtual device: no real physical DMA address
     return pa;
+}
+
+STDMETHODIMP_(PADAPTER_OBJECT) CMiniportWaveCyclicStream::GetAdapterObject()
+{
+    // Virtual device: there is no system DMA adapter behind this channel.
+    return nullptr;
 }
 
 STDMETHODIMP_(void) CMiniportWaveCyclicStream::CopyTo(PVOID dst, PVOID src, ULONG count)
@@ -367,16 +675,18 @@ void CMiniportWaveCyclicStream::ServiceLoopback()
     }
 
     AdvancePosition(bytes);
+
+    // Signal the service group so PortCls performs the client<->DMA copies
+    // for this interval.  Without this Notify no audio ever reaches (or
+    // leaves) the client buffers, no matter how busily the timer ticks.
+    if (m_miniport != nullptr && m_miniport->m_port != nullptr &&
+        m_miniport->m_serviceGroup != nullptr)
+    {
+        m_miniport->m_port->Notify(m_miniport->m_serviceGroup);
+    }
 }
 
-// --- IMiniportWaveCyclicStream ---------------------------------------------
-STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclicStream::SetFormat(PKSDATAFORMAT format)
-{
-    PAGED_CODE();
-    UNREFERENCED_PARAMETER(format);
-    return STATUS_SUCCESS;   // single fixed format
-}
-
+// --- IMiniportWaveCyclicStream (DISPATCH-capable entry points) ---------------
 STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclicStream::SetState(KSSTATE newState)
 {
     if (newState == m_state)
@@ -420,16 +730,10 @@ STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclicStream::GetPosition(PULONG position)
 STDMETHODIMP_(NTSTATUS)
 CMiniportWaveCyclicStream::NormalizePhysicalPosition(PLONGLONG physicalPosition)
 {
-    UNREFERENCED_PARAMETER(physicalPosition);
-    return STATUS_SUCCESS;
-}
-
-STDMETHODIMP_(NTSTATUS)
-CMiniportWaveCyclicStream::SetNotificationFreq(ULONG interval, PULONG frameSize)
-{
-    PAGED_CODE();
-    UNREFERENCED_PARAMETER(interval);
-    *frameSize = m_bytesPerInterval;
+    // Convert a byte count into time in 100-nanosecond units at the fixed
+    // engine format (MSVAD formula for a constant byte rate).
+    *physicalPosition =
+        (*physicalPosition * 10000000LL) / DISCROD_AVG_BYTES_PER_SEC;
     return STATUS_SUCCESS;
 }
 

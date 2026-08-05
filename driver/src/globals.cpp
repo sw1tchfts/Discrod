@@ -51,6 +51,8 @@ void FreeLoopback()
     }
 }
 
+#pragma code_seg()  // GetLoopback is called from the timer DPC at DISPATCH_LEVEL
+
 CLoopbackBuffer* GetLoopback()
 {
     return g_loopback;

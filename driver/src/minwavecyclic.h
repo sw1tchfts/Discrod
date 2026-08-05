@@ -31,6 +31,16 @@ Environment:
 #define DISCROD_TIMER_PERIOD_NS  (10 * 10000)
 #define DISCROD_NOTIFY_INTERVAL_MS 10
 
+// Wave filter pin IDs -- indices into the PCPIN_DESCRIPTOR tables in
+// minwavecyclic.cpp.  Pin 0 is the streaming pin PortCls opens on behalf of
+// audio clients; pin 1 is the bridge pin the adapter physically connects to
+// the matching topology filter (PcRegisterPhysicalConnection in adapter.cpp).
+enum DISCROD_WAVE_PIN
+{
+    DiscrodWavePinStream = 0,
+    DiscrodWavePinBridge = 1
+};
+
 class CMiniportWaveCyclicStream;
 
 //=============================================================================
@@ -43,17 +53,18 @@ public:
     CMiniportWaveCyclic(PUNKNOWN other, DISCROD_ROLE role);
     ~CMiniportWaveCyclic();
 
-    IMP_IMiniportWaveCyclic;   // Init, GetDescription, DataRangeIntersection, NewStream
-    IMP_IMiniport;             // GetDescription, DataRangeIntersection
+    // IMP_IMiniportWaveCyclic already expands IMP_IMiniport, so this single
+    // macro declares GetDescription/DataRangeIntersection/Init/NewStream.
+    IMP_IMiniportWaveCyclic;
     STDMETHODIMP_(void) PowerChangeNotify(POWER_STATE state);
 
     DISCROD_ROLE Role() const { return m_role; }
 
 private:
     DISCROD_ROLE  m_role;
-    PADAPTERCOMMON m_adapter;
-    PPORTWAVECYCLIC m_port;
-    BOOLEAN       m_streamAllocated;   // single stream per pin for the cable
+    PPORTWAVECYCLIC m_port;          // stored (AddRef'd) in Init
+    PSERVICEGROUP m_serviceGroup;    // created in Init; signalled from the DPC
+    BOOLEAN       m_streamAllocated; // single stream per pin for the cable
 
     friend class CMiniportWaveCyclicStream;
 };

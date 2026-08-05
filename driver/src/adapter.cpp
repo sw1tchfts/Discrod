@@ -31,7 +31,8 @@ extern "C" DRIVER_ADD_DEVICE AddDevice;
 static NTSTATUS StartDevice(PDEVICE_OBJECT, PIRP, PRESOURCELIST);
 static NTSTATUS InstallWaveMiniport(PDEVICE_OBJECT, PIRP, DISCROD_ROLE,
                                     PUNKNOWN* outPortWave);
-static NTSTATUS InstallTopologyMiniport(PDEVICE_OBJECT, PIRP, DISCROD_ROLE);
+static NTSTATUS InstallTopologyMiniport(PDEVICE_OBJECT, PIRP, DISCROD_ROLE,
+                                        PUNKNOWN* outPortTopo);
 
 #pragma code_seg("INIT")
 extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT driverObject,
@@ -68,33 +69,65 @@ static NTSTATUS StartDevice(PDEVICE_OBJECT deviceObject, PIRP irp,
         return status;
     }
 
-    // --- Render endpoint (appears as "Speakers") ---------------------------
     PUNKNOWN renderWavePort = nullptr;
+    PUNKNOWN renderTopoPort = nullptr;
+    PUNKNOWN captureWavePort = nullptr;
+    PUNKNOWN captureTopoPort = nullptr;
+
+    // --- Render endpoint (appears as "Speakers") ---------------------------
     status = InstallWaveMiniport(deviceObject, irp, RoleRender, &renderWavePort);
     if (NT_SUCCESS(status))
     {
-        status = InstallTopologyMiniport(deviceObject, irp, RoleRender);
+        status = InstallTopologyMiniport(deviceObject, irp, RoleRender,
+                                         &renderTopoPort);
+    }
+    if (NT_SUCCESS(status))
+    {
+        // Wire the wave filter's bridge pin to the topology's bridge pin so
+        // the endpoint builder sees one continuous render path.
+        status = PcRegisterPhysicalConnection(deviceObject,
+                                              renderWavePort,
+                                              DiscrodWavePinBridge,
+                                              renderTopoPort,
+                                              DiscrodTopoPinWaveBridge);
     }
 
     // --- Capture endpoint (appears as "Microphone") ------------------------
     if (NT_SUCCESS(status))
     {
-        PUNKNOWN captureWavePort = nullptr;
         status = InstallWaveMiniport(deviceObject, irp, RoleCapture,
                                      &captureWavePort);
-        if (NT_SUCCESS(status))
-        {
-            status = InstallTopologyMiniport(deviceObject, irp, RoleCapture);
-        }
-        if (captureWavePort)
-        {
-            captureWavePort->Release();
-        }
+    }
+    if (NT_SUCCESS(status))
+    {
+        status = InstallTopologyMiniport(deviceObject, irp, RoleCapture,
+                                         &captureTopoPort);
+    }
+    if (NT_SUCCESS(status))
+    {
+        // Capture flows the other way: topology bridge (out) -> wave bridge (in).
+        status = PcRegisterPhysicalConnection(deviceObject,
+                                              captureTopoPort,
+                                              DiscrodTopoPinWaveBridge,
+                                              captureWavePort,
+                                              DiscrodWavePinBridge);
     }
 
     if (renderWavePort)
     {
         renderWavePort->Release();
+    }
+    if (renderTopoPort)
+    {
+        renderTopoPort->Release();
+    }
+    if (captureWavePort)
+    {
+        captureWavePort->Release();
+    }
+    if (captureTopoPort)
+    {
+        captureTopoPort->Release();
     }
 
     if (!NT_SUCCESS(status))
@@ -150,7 +183,8 @@ static NTSTATUS InstallWaveMiniport(PDEVICE_OBJECT deviceObject, PIRP irp,
 }
 
 static NTSTATUS InstallTopologyMiniport(PDEVICE_OBJECT deviceObject, PIRP irp,
-                                        DISCROD_ROLE role)
+                                        DISCROD_ROLE role,
+                                        PUNKNOWN* outPortTopo)
 {
     PAGED_CODE();
 
@@ -177,6 +211,13 @@ static NTSTATUS InstallTopologyMiniport(PDEVICE_OBJECT deviceObject, PIRP irp,
         miniport->Release();
     }
 
-    port->Release();
+    if (NT_SUCCESS(status))
+    {
+        *outPortTopo = static_cast<PUNKNOWN>(port);   // caller releases
+    }
+    else
+    {
+        port->Release();
+    }
     return status;
 }
