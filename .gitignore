@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# Config written at runtime
+config.json
+
+# Driver build output (WDK / MSBuild)
+driver/x64/
+driver/Debug/
+driver/Release/
+driver/*.cer
+*.sys
+*.cat
+*.pdb
+*.obj
+*.log
+.vs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Audio clips dropped in by the user (keep the folder, ignore media)
+app/clips/*.wav
+app/clips/*.mp3
+app/clips/*.ogg
+app/clips/*.flac
+app/clips/*.aiff
