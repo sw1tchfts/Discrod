@@ -81,11 +81,25 @@ class Controller:
         self.on_error = None
 
     def _get_clip(self, path: str) -> Clip:
-        with self._cache_lock:
-            clip = self._clip_cache.get(path)
-            if clip is None:
-                clip = Clip.load(path, self.engine.sample_rate, self.engine.channels)
-                self._clip_cache[path] = clip
+        # Decode OUTSIDE the lock: holding it across Clip.load would make a
+        # cache-hit pad press (GUI thread) stall behind the preload thread's
+        # in-flight decode — the exact stall preloading exists to remove.
+        for _ in range(3):
+            with self._cache_lock:
+                clip = self._clip_cache.get(path)
+                sample_rate = self.engine.sample_rate
+                channels = self.engine.channels
+            if clip is not None and clip.sample_rate == sample_rate:
+                return clip
+            clip = Clip.load(path, sample_rate, channels)
+            with self._cache_lock:
+                cached = self._clip_cache.get(path)
+                if cached is not None and cached.sample_rate == sample_rate:
+                    return cached      # concurrent decode won; use one instance
+                if self.engine.sample_rate == sample_rate:
+                    self._clip_cache[path] = clip
+                    return clip
+            # Engine sample rate changed mid-decode: loop and decode again.
         return clip
 
     def invalidate_cache(self) -> None:

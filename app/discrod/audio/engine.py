@@ -384,13 +384,25 @@ class AudioEngine:
 
 
 def list_devices():
-    """Return (input_devices, output_devices) as ``[(index, name), ...]``."""
+    """Return (input_devices, output_devices) as
+    ``[(index, name, hostapi_name), ...]``.
+
+    The host API matters on Windows: PortAudio lists the same physical device
+    once per API (MME/DirectSound/WASAPI/WDM-KS) under an identical name, so
+    name alone cannot re-identify a selection across sessions.
+    """
     if sd is None:
         return [], []
+    try:
+        hostapis = [api["name"] for api in sd.query_hostapis()]
+    except Exception:
+        hostapis = []
     inputs, outputs = [], []
     for idx, dev in enumerate(sd.query_devices()):
+        api_index = dev.get("hostapi", -1)
+        api = hostapis[api_index] if 0 <= api_index < len(hostapis) else ""
         if dev["max_input_channels"] > 0:
-            inputs.append((idx, dev["name"]))
+            inputs.append((idx, dev["name"], api))
         if dev["max_output_channels"] > 0:
-            outputs.append((idx, dev["name"]))
+            outputs.append((idx, dev["name"], api))
     return inputs, outputs

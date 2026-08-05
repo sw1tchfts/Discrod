@@ -179,6 +179,59 @@ def test_zero_length_clip_does_not_hang_render():
     assert np.allclose(buf, 0.0)
 
 
+def test_stop_after_completed_fade_cannot_resurrect_voice():
+    clip = make_clip(0.5, frames=100000)
+    voice = Voice(clip, "Soundboard", mode=MODE_GATE, key=("note", 60))
+    buf = np.zeros((256, 2), dtype=np.float32)
+    voice.render_into(buf)
+    voice.stop(fade_frames=64)
+    voice.render_into(np.zeros((256, 2), dtype=np.float32))  # fade completes
+    assert not voice.active
+    voice.stop()                          # racing stop() must be a no-op now
+    assert not voice.active
+    buf = np.zeros((256, 2), dtype=np.float32)
+    voice.render_into(buf)
+    assert np.allclose(buf, 0.0)          # no 5 ms of resurrected audio
+
+
+def test_cached_clip_lookup_does_not_block_behind_decode(monkeypatch):
+    """A cache-hit pad press must not wait for the preload thread's in-flight
+    decode of a different clip."""
+    import threading
+    import time
+    from discrod.mapping import Controller, PadBank, PadMapping
+    from discrod.audio import clip as clip_mod
+
+    eng = AudioEngine(SR, block_size=64)
+    bank = PadBank()
+    bank.set(PadMapping(note=60, clip_path="fast.wav"))
+    bank.set(PadMapping(note=61, clip_path="slow.wav"))
+    ctrl = Controller(eng, bank)
+
+    slow_started = threading.Event()
+    release_slow = threading.Event()
+
+    def fake_load(path, target_sr, channels=2):
+        if path == "slow.wav":
+            slow_started.set()
+            assert release_slow.wait(5.0)
+        return make_clip(0.5)
+
+    monkeypatch.setattr(clip_mod.Clip, "load", staticmethod(fake_load))
+    monkeypatch.setattr("discrod.mapping.Clip", clip_mod.Clip)
+
+    ctrl._get_clip("fast.wav")            # warm the cache
+    slow_thread = threading.Thread(target=ctrl._get_clip, args=("slow.wav",))
+    slow_thread.start()
+    assert slow_started.wait(5.0)
+    t0 = time.perf_counter()
+    ctrl._get_clip("fast.wav")            # cache hit while slow decode in flight
+    elapsed = time.perf_counter() - t0
+    release_slow.set()
+    slow_thread.join(5.0)
+    assert elapsed < 0.5, f"cache hit blocked {elapsed:.2f}s behind a decode"
+
+
 def test_resampler_never_returns_empty_for_loadable_audio():
     data = np.ones((1, 2), dtype=np.float32)
     out = _resample_linear(data, 96000, 48000)
@@ -245,6 +298,27 @@ def test_compressor_reengages_quickly_after_silence():
     # And it settles into real gain reduction shortly after.
     ms20 = int(SR * 0.020)
     assert np.max(np.abs(onset[ms20:ms20 * 2])) < level * 0.9
+
+
+def test_compressor_tracks_envelope_above_zero_dbfs():
+    """Summed voices with positive pad gain routinely exceed 0 dBFS before the
+    channel trim.  An upper clamp on the envelope re-attacks at every block
+    boundary — a 187 Hz gain sawtooth (audible buzz).  Block-wise processing
+    must match single-call processing exactly."""
+    hot = np.full((48 * 256, 2), db_to_linear(6.0), dtype=np.float32)
+    one_call = hot.copy()
+    comp_a = Compressor(SR, threshold_db=-18.0, ratio=4.0, attack_ms=10.0,
+                        release_ms=120.0, enabled=True)
+    comp_a.process(one_call)
+    blockwise = hot.copy()
+    comp_b = Compressor(SR, threshold_db=-18.0, ratio=4.0, attack_ms=10.0,
+                        release_ms=120.0, enabled=True)
+    for start in range(0, blockwise.shape[0], 256):
+        comp_b.process(blockwise[start:start + 256])
+    assert np.allclose(blockwise, one_call, atol=1e-5)
+    # And the settled gain is constant across a block boundary (no sawtooth).
+    tail = blockwise[-512:, 0]
+    assert np.max(tail) - np.min(tail) < 1e-4
 
 
 def test_gate_closes_on_quiet_signal():

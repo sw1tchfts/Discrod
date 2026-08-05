@@ -171,12 +171,14 @@ class MainWindow(QtWidgets.QMainWindow):
         inputs, outputs = list_devices()
         self.input_combo.clear()
         self.input_combo.addItem("(none)", None)
-        for idx, name in inputs:
-            self.input_combo.addItem(name, idx)
+        for idx, name, api in inputs:
+            label = f"{name} [{api}]" if api else name
+            self.input_combo.addItem(label, (idx, name, api))
         self.output_combo.clear()
         self.output_combo.addItem("(default)", None)
-        for idx, name in outputs:
-            self.output_combo.addItem(name, idx)
+        for idx, name, api in outputs:
+            label = f"{name} [{api}]" if api else name
+            self.output_combo.addItem(label, (idx, name, api))
         self.midi_combo.clear()
         self.midi_combo.addItem("(none)", None)
         for name in list_ports():
@@ -184,31 +186,65 @@ class MainWindow(QtWidgets.QMainWindow):
         self._select_saved_devices()
 
     def _select_saved_devices(self):
-        # Audio devices are persisted by NAME: PortAudio indices shift whenever
-        # a device is plugged/unplugged or across reboots, so a saved index can
-        # silently select the wrong device.  Integer values are still accepted
-        # for configs written by older versions.
-        def select(combo, value):
+        # Audio devices are persisted as {name, hostapi}: PortAudio indices
+        # shift across replug/reboot, and Windows lists the same device name
+        # once per host API, so both fields are needed to re-identify the
+        # selection.  Bare-name and integer values from older configs are
+        # still accepted.
+        def select_audio(combo, value):
+            if value is None:
+                return
+            name = api = None
+            if isinstance(value, dict):
+                name, api = value.get("name"), value.get("hostapi")
+            elif isinstance(value, str):
+                name = value
+            for i in range(combo.count()):
+                data = combo.itemData(i)
+                if data is None:
+                    continue
+                if isinstance(value, int):
+                    if data[0] == value:
+                        combo.setCurrentIndex(i)
+                        return
+                elif data[1] == name and (api is None or data[2] == api):
+                    combo.setCurrentIndex(i)
+                    return
+            if api is not None:
+                # Same name, different host API (e.g. the API list changed):
+                # better than losing the device entirely.
+                for i in range(combo.count()):
+                    data = combo.itemData(i)
+                    if data is not None and data[1] == name:
+                        combo.setCurrentIndex(i)
+                        return
+            self.statusBar().showMessage(
+                f"Saved device not found: {name or value}", 8000)
+
+        def select_midi(combo, value):
             if value is None:
                 return
             for i in range(combo.count()):
-                if (combo.itemText(i) == value if isinstance(value, str)
-                        else combo.itemData(i) == value):
+                if combo.itemData(i) == value:
                     combo.setCurrentIndex(i)
                     return
             self.statusBar().showMessage(
-                f"Saved device not found: {value}", 8000)
-        select(self.input_combo, self.cfg.input_device)
-        select(self.output_combo, self.cfg.output_device)
-        select(self.midi_combo, self.cfg.midi_port)
+                f"Saved MIDI port not found: {value}", 8000)
+
+        select_audio(self.input_combo, self.cfg.input_device)
+        select_audio(self.output_combo, self.cfg.output_device)
+        select_midi(self.midi_combo, self.cfg.midi_port)
 
     # --- engine -------------------------------------------------------------
     def _toggle_engine(self, on):
         if on:
+            def device_index(combo):
+                data = combo.currentData()
+                return data[0] if data is not None else None
             try:
                 self.engine.start(
-                    input_device=self.input_combo.currentData(),
-                    output_device=self.output_combo.currentData(),
+                    input_device=device_index(self.input_combo),
+                    output_device=device_index(self.output_combo),
                 )
                 port = self.midi_combo.currentData()
                 if port:
@@ -261,9 +297,12 @@ class MainWindow(QtWidgets.QMainWindow):
         chan_combo.setCurrentText(mapping.channel)
         if chan_combo.currentText() != mapping.channel:
             # Mapping referenced a channel that no longer exists (stale/edited
-            # config); rewrite it to what the row actually shows so the UI and
-            # the trigger path agree.
-            mapping.channel = chan_combo.currentText()
+            # config).  Fall back to the soundboard bus — the same fallback
+            # trigger_clip applies — and show it, so the UI and the trigger
+            # path agree (a failed setCurrentText leaves index 0, which is the
+            # Microphone strip and would route the clip through the mic chain).
+            mapping.channel = self.engine.soundboard_channel.name
+            chan_combo.setCurrentText(mapping.channel)
         chan_combo.currentTextChanged.connect(
             lambda v, n=mapping.note: self._update_mapping(n, channel=v))
         self.table.setCellWidget(row, 2, chan_combo)
@@ -399,13 +438,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.midi.close()
         self.engine.stop()
 
-        def device_name(combo):
+        def device_value(combo):
             # "(none)"/"(default)" carry data None -> persist None; otherwise
-            # persist the stable device name, not the volatile PortAudio index.
-            return combo.currentText() if combo.currentData() is not None else None
+            # persist {name, hostapi} — stable across replug/reboot, unlike
+            # the PortAudio index, and unambiguous across Windows host APIs,
+            # unlike the bare name.
+            data = combo.currentData()
+            if data is None:
+                return None
+            return {"name": data[1], "hostapi": data[2]}
 
-        self.cfg.input_device = device_name(self.input_combo)
-        self.cfg.output_device = device_name(self.output_combo)
+        self.cfg.input_device = device_value(self.input_combo)
+        self.cfg.output_device = device_value(self.output_combo)
         self.cfg.midi_port = self.midi_combo.currentData()
         self.cfg.engine = self.engine.to_dict()
         self.cfg.bank = self.bank.to_dict()

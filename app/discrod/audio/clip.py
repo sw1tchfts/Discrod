@@ -104,14 +104,20 @@ class Voice:
             remaining = n - self.pos
             take = min(frames - written, remaining)
             seg = src[self.pos:self.pos + take]
-            if self._fade_left > 0:
-                audible = min(take, self._fade_left)
-                ramp = (self._fade_left - np.arange(audible, dtype=np.float32)) \
+            # Work on a local copy of the fade counter: stop() runs on the
+            # UI/MIDI thread and may re-arm the attribute mid-block; deciding
+            # deactivation from a re-read could resurrect a finished fade at
+            # full gain — precisely the click the fade exists to prevent.
+            fade_left = self._fade_left
+            if fade_left > 0:
+                audible = min(take, fade_left)
+                ramp = (fade_left - np.arange(audible, dtype=np.float32)) \
                     / self._fade_total
                 buffer[written:written + audible] += \
                     seg[:audible] * (self.gain * ramp)[:, None]
-                self._fade_left -= audible
-                if self._fade_left <= 0:
+                fade_left -= audible
+                self._fade_left = fade_left
+                if fade_left <= 0:
                     self.active = False
             elif self.gain != 1.0:
                 buffer[written:written + take] += seg * self.gain

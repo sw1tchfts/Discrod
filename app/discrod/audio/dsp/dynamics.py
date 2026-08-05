@@ -144,7 +144,10 @@ class Compressor(Processor):
         np.maximum(levels_db, floor_db, out=levels_db)
         levels = levels_db.tolist()
         gains_db = np.empty(len(levels), dtype=np.float64)
-        env_db = min(max(self._env_db, floor_db), 0.0)
+        # Clamp from below only: the envelope must track levels above 0 dBFS
+        # (summed voices with positive pad gain), otherwise it re-attacks at
+        # every block boundary — an audible block-rate sawtooth.
+        env_db = max(self._env_db, floor_db)
         for n, level_db in enumerate(levels):
             # Smooth the detector with attack/release ballistics.
             if level_db > env_db:
