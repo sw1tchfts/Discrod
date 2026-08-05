@@ -13,22 +13,8 @@ venv/
 # Config written at runtime
 config.json
 
-# Driver build output (WDK / MSBuild)
-driver/x64/
-driver/Debug/
-driver/Release/
-driver/*.cer
-*.sys
-*.cat
-*.pdb
-*.obj
-*.log
+# IDE
 .vs/
-
-# APO build output (CMake) and endpoint backups
-apo/build/
-apo/x64/
-*.reg
 
 # OS
 .DS_Store

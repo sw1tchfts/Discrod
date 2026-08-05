@@ -6,8 +6,9 @@ Responsibilities:
   * Sum channels to a master bus and write to the output device.
 
 Routing for Discord: set the engine's **output device** to the render side of
-our virtual audio driver (``Discrod Virtual Cable``).  Discord then selects the
-driver's **capture** endpoint as its microphone, receiving mic + clips with all
+a signed virtual cable (e.g. VB-CABLE's ``CABLE Input``; see
+:mod:`discrod.audio.cables` for auto-detection).  Discord then selects the
+cable's **capture** endpoint as its microphone, receiving mic + clips with all
 processing applied.  Optionally a second output stream can feed local monitoring
 (headphones) so you hear what you send.
 
@@ -81,10 +82,6 @@ class AudioEngine:
         self.input_device = None
         self.output_device = None
         self.running = False
-        # APO transport (driver-free): set when running via the shared-memory
-        # bridge instead of PortAudio devices.  Mutually exclusive with start().
-        self.apo_bridge = None
-        self.apo_mode = False
         # Invoked (from the thread calling start()) when device negotiation
         # changes the engine sample rate; clip caches must be invalidated.
         self.on_sample_rate_changed = None
@@ -218,44 +215,6 @@ class AudioEngine:
             self.master_meter = float(np.max(np.abs(out)))
         return out
 
-    def render_soundboard(self, frames: int,
-                          out: np.ndarray | None = None) -> np.ndarray:
-        """Mix only the non-mic (soundboard) channels for the APO transport.
-
-        In APO mode the microphone is captured and processed *inside* the APO,
-        so the app renders everything except the mic bus and ships it over the
-        bridge to be mixed onto the real mic.  Master gain is intentionally not
-        applied here: the APO owns the final mix, and per-channel gains already
-        shape the soundboard level (see apo_bridge for the parameter split).
-        """
-        if out is None or out.shape[0] != frames:
-            out = np.zeros((frames, self.channels), dtype=np.float32)
-        else:
-            out[:] = 0.0
-
-        any_solo = any(ch.solo for ch in self.channels_list)
-        with self._voices_lock:
-            voices = list(self._voices)
-
-        for ch in self.channels_list:
-            if ch.kind == KIND_MIC:
-                continue
-            scratch = np.zeros((frames, self.channels), dtype=np.float32)
-            for v in voices:
-                if v.active and v.channel_name == ch.name:
-                    v.render_into(scratch)
-            ch.process(scratch)
-            if (not any_solo) or ch.solo:
-                if not ch.mute:
-                    out += scratch
-
-        with self._voices_lock:
-            self._voices = [v for v in self._voices if v.active]
-            self._toggle_voices = {k: v for k, v in self._toggle_voices.items()
-                                   if v.active}
-        np.clip(out, -1.0, 1.0, out=out)
-        return out
-
     def _read_mic(self, frames: int) -> np.ndarray:
         """Consume mic frames with priming and drift bounding.
 
@@ -345,41 +304,6 @@ class AudioEngine:
         self._input_stream = input_stream
         self._output_stream = output_stream
         self.running = True
-
-    # --- APO transport lifecycle -------------------------------------------
-    def start_apo(self, sample_rate: int | None = None) -> None:
-        """Run in driver-free APO mode: no audio devices, soundboard streamed
-        to the capture APO over the shared-memory bridge.
-
-        The APO applies the mic DSP chain and mixes our soundboard onto the
-        real microphone, so Discord needs only to select that mic.  The bridge
-        publishes params continuously and a background thread paces the
-        soundboard render against the APO's real consumption.
-        """
-        from .apo_bridge import ApoBridge  # local import: optional transport
-
-        if self.running:
-            self.stop()
-        self.stop_apo()
-        if sample_rate is not None:
-            self.set_sample_rate(int(sample_rate))
-        self._clear_voices()
-
-        bridge = ApoBridge(sample_rate=self.sample_rate,
-                           ring_channels=self.channels)
-        bridge.open()
-        bridge.start_stream(self, block_size=self.block_size)
-        self.apo_bridge = bridge
-        self.apo_mode = True
-
-    def stop_apo(self) -> None:
-        self.apo_mode = False
-        if self.apo_bridge is not None:
-            try:
-                self.apo_bridge.close()
-            except Exception:
-                pass
-            self.apo_bridge = None
 
     def _negotiate_sample_rate(self) -> int:
         """Pick a sample rate both selected devices accept.
