@@ -29,7 +29,10 @@ nothing here changes machine integrity state).
    serves you well. *(Already have Steam? The Steam Streaming Microphone
    device also works and the app detects it too — see
    [`ALTERNATIVES.md`](ALTERNATIVES.md).)*
-2. **Run the app:**
+2. **Run the app:** double-click **`start-discrod.bat`** (repo root). First
+   run sets up the environment and installs dependencies automatically; it
+   only needs [Python 3.10+](https://www.python.org/downloads/) installed
+   with *Add python.exe to PATH* ticked. (Manual equivalent:
 
    ```bash
    cd app
@@ -37,6 +40,8 @@ nothing here changes machine integrity state).
    pip install -r requirements.txt
    python -m discrod
    ```
+
+   )
 
 3. In the app: the **Virtual mic out** is auto-selected if a known cable is
    installed (status bar confirms it). Pick your **Mic** and **MIDI**

@@ -36,6 +36,14 @@ and **CABLE Output** under Input.
 
 ## 2. Run the app
 
+Double-click **`start-discrod.bat`** in the repo root — it creates the
+virtual environment and installs dependencies on first run (and re-installs
+them automatically whenever `requirements.txt` changes), then launches the
+app. Requires [Python 3.10+](https://www.python.org/downloads/) installed
+with *Add python.exe to PATH* ticked.
+
+Manual equivalent:
+
 ```powershell
 cd app
 python -m venv .venv
