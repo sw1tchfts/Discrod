@@ -119,7 +119,7 @@ def test_read_monitor_primes_before_playing():
     first = eng._read_monitor(BLOCK)
     assert np.max(np.abs(first)) == 0.0
     # Fill to the prime level -> audio flows.
-    for _ in range(AudioEngine.PRIME_BLOCKS):
+    for _ in range(AudioEngine.MONITOR_PRIME_BLOCKS):
         eng.render_block(BLOCK, mic_block=np.zeros((BLOCK, 2), np.float32))
     primed = eng._read_monitor(BLOCK)
     assert np.max(np.abs(primed)) > 0.0
@@ -127,14 +127,50 @@ def test_read_monitor_primes_before_playing():
 
 def test_read_monitor_drops_backlog_after_drift():
     eng = make_engine()
-    eng.trigger_clip(make_clip(0.25, frames=48000 * 2), "Soundboard",
+    eng.trigger_clip(make_clip(0.25, frames=48000 * 4), "Soundboard",
                      MODE_ONESHOT)
-    overfill = AudioEngine.PRIME_BLOCKS * AudioEngine.MAX_FILL_FACTOR + 4
+    overfill = (AudioEngine.MONITOR_PRIME_BLOCKS
+                * AudioEngine.MAX_FILL_FACTOR + 4)
     for _ in range(overfill):
         eng.render_block(BLOCK, mic_block=np.zeros((BLOCK, 2), np.float32))
     eng._read_monitor(BLOCK)
     # Backlog was clamped back to the prime level (one block since consumed).
-    assert eng.monitor_ring.available <= eng._prime_frames
+    assert eng.monitor_ring.available <= eng._monitor_prime_frames
+
+
+def test_monitor_prime_is_deeper_than_mic_prime():
+    # The monitor writer (virtual-cable callback) is bursty; a shallow prime
+    # hovers at the underrun threshold and clicks. Guard the cushion.
+    eng = make_engine()
+    assert eng._monitor_prime_frames >= 3 * eng._prime_frames
+
+
+def test_underrun_fades_out_and_reprimes():
+    eng = make_engine()
+    eng._monitor_primed = True  # force primed with a partial block in the ring
+    eng.monitor_ring.write(np.ones((100, 2), dtype=np.float32))
+    out = eng._read_monitor(BLOCK)
+    # Remainder fades from full scale to zero, then true silence: no hard edge.
+    assert out[0, 0] == 1.0
+    assert out[99, 0] == 0.0
+    assert np.all(out[100:] == 0.0)
+    assert np.all(np.abs(np.diff(out[:, 0])) < 0.05)
+    assert eng._monitor_primed is False
+
+
+def test_resume_after_prime_fades_in():
+    eng = make_engine()
+    eng.monitor_ring.write(
+        np.ones((eng._monitor_prime_frames, 2), dtype=np.float32))
+    block = eng._read_monitor(BLOCK)
+    fade = AudioEngine.MONITOR_FADE
+    # First sample silent, ramp up, then full scale: no click on resume.
+    assert block[0, 0] == 0.0
+    assert np.all(block[fade:, 0] == 1.0)
+    assert np.all(np.abs(np.diff(block[:, 0])) < 0.05)
+    # Steady state afterwards: no fade applied to the next block.
+    again = eng._read_monitor(BLOCK)
+    assert np.all(again[:, 0] == 1.0)
 
 
 def test_config_roundtrip_monitor_mic():

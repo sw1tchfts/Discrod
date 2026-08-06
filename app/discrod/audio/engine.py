@@ -51,6 +51,14 @@ class AudioEngine:
     #: Occupancy (in multiples of the prime level) beyond which the backlog is
     #: dropped to re-bound latency after clock drift.
     MAX_FILL_FACTOR = 3
+    #: Monitor ring slack (in blocks). Much deeper than the mic's: the monitor
+    #: is written by the virtual cable's callback, whose pacing is at the
+    #: mercy of the cable driver and can be bursty, and monitoring tolerates
+    #: latency (~64 ms at 256/48k) that the live path can't. A shallow cushion
+    #: here hovers at the priming threshold and clicks on every callback race.
+    MONITOR_PRIME_BLOCKS = 12
+    #: Declick ramp length (frames) applied entering/leaving monitor gaps.
+    MONITOR_FADE = 128
 
     def __init__(self, sample_rate: int = 48000, block_size: int = 256,
                  channels: int = 2):
@@ -67,11 +75,15 @@ class AudioEngine:
         # mix at exactly the level it enters the virtual mic, optionally
         # including the processed mic (monitor_mic) to audition the FX chain.
         # Same decoupling pattern as the mic: independent device clocks
-        # bridged by a primed, drift-bounded ring.
+        # bridged by a primed, drift-bounded ring — but with a deeper cushion
+        # and declicked gap edges (see _read_monitor).
         self.monitor_ring = RingBuffer(sample_rate, channels)
         self.monitor_enabled = False
         self.monitor_mic = False
         self._monitor_primed = False
+        self._monitor_prime_frames = self.MONITOR_PRIME_BLOCKS * block_size
+        self._monitor_max_fill = self._monitor_prime_frames * self.MAX_FILL_FACTOR
+        self._monitor_fade_in = True
 
         # Default channels: a mic bus and a soundboard bus.
         self.mic_channel = Channel("Microphone", sample_rate, channels, KIND_MIC)
@@ -121,6 +133,7 @@ class AudioEngine:
         self._mic_primed = False
         self.monitor_ring = RingBuffer(sample_rate, self.channels)
         self._monitor_primed = False
+        self._monitor_fade_in = True
         if self.on_sample_rate_changed is not None:
             self.on_sample_rate_changed(sample_rate)
 
@@ -269,25 +282,48 @@ class AudioEngine:
         return ring.read(frames)
 
     def _read_monitor(self, frames: int) -> np.ndarray:
-        """Consume monitor frames — same priming/drift-bounding as the mic.
+        """Consume monitor frames: primed, drift-bounded, and declicked.
 
         The monitor ring is written by the cable-output callback and drained
-        by the monitor device's callback; the two devices free-run on
-        independent clocks, so the identical prime/underrun/backlog-drop
-        treatment applies.
+        by the monitor device's callback; the two free-run on independent
+        clocks, and the cable side's pacing can be bursty. Differences from
+        the mic path, both learned from audible clicking:
+
+        * A deep cushion (_monitor_prime_frames) so occupancy never hovers at
+          the threshold where every callback race is an underrun.
+        * Gap edges are ramped: an underrun fades out across whatever frames
+          remain instead of cutting mid-block, and the first block after a
+          prime or a drift-drop fades in. Discontinuities become inaudible.
         """
         ring = self.monitor_ring
         avail = ring.available
         if not self._monitor_primed:
-            if avail < self._prime_frames:
+            if avail < self._monitor_prime_frames:
                 return np.zeros((frames, self.channels), dtype=np.float32)
             self._monitor_primed = True
-        if avail > self._max_fill:
-            ring.drop(avail - self._prime_frames)
-            avail = self._prime_frames
+            self._monitor_fade_in = True
+        if avail > self._monitor_max_fill:
+            ring.drop(avail - self._monitor_prime_frames)
+            avail = self._monitor_prime_frames
+            self._monitor_fade_in = True  # dropped frames = discontinuity
         if avail < frames:
+            # Underrun: emit the remainder as a fade-out, then silence, and
+            # re-enter priming for one clean gap instead of edge-y crackle.
             self._monitor_primed = False
-        return ring.read(frames)
+            out = np.zeros((frames, self.channels), dtype=np.float32)
+            if avail > 0:
+                tail = ring.read(avail)
+                ramp = np.linspace(1.0, 0.0, avail, dtype=np.float32)
+                out[:avail] = tail * ramp[:, None]
+            self._monitor_fade_in = True
+            return out
+        block = ring.read(frames)
+        if self._monitor_fade_in:
+            n = min(self.MONITOR_FADE, frames)
+            ramp = np.linspace(0.0, 1.0, n, dtype=np.float32)
+            block[:n] *= ramp[:, None]
+            self._monitor_fade_in = False
+        return block
 
     # --- PortAudio callbacks ------------------------------------------------
     def _input_callback(self, indata, frames, time_info, status):  # noqa: D401
@@ -329,6 +365,7 @@ class AudioEngine:
         self._mic_primed = False
         self.monitor_ring.clear()
         self._monitor_primed = False
+        self._monitor_fade_in = True
 
         # Construct all streams before starting any, and unwind on any
         # failure — a half-started engine must not leak a live input stream
@@ -351,11 +388,14 @@ class AudioEngine:
                 latency="low",
             )
             if self.monitor_device is not None:
+                # latency="high": monitoring tolerates buffering the live
+                # cable path can't, and the extra host slack absorbs the
+                # cable-callback burstiness that clicks at "low".
                 monitor_stream = sd.OutputStream(
                     device=self.monitor_device, samplerate=self.sample_rate,
                     blocksize=self.block_size, channels=self.channels,
                     dtype="float32", callback=self._monitor_callback,
-                    latency="low",
+                    latency="high",
                 )
             if input_stream is not None:
                 input_stream.start()
