@@ -279,6 +279,46 @@ def test_mic_servo_absorbs_fast_writer():
     assert eng.mic_ring.available < eng._mic_tap.max_fill
 
 
+def test_tap_bridges_nominal_rate_mismatch_48k_to_44k1():
+    # A 48000-rate ring consumed by a 44100-rate callback: base_ratio carries
+    # the conversion (~1.0884 input frames per output frame). This is the
+    # fallback for devices that reject the engine rate (PaErrorCode -9997).
+    from discrod.audio.engine import _ServoTap
+    from discrod.audio.ringbuffer import RingBuffer
+    base = 48000.0 / 44100.0
+    tap = _ServoTap(2, 12 * BLOCK, 36 * BLOCK, 128, 0.05, 0.02, 0.05,
+                    base_ratio=base)
+    ring = RingBuffer(48000, 2)
+    ring.write(np.ones((tap.prime_frames, 2), dtype=np.float32))
+    outputs = []
+    for _ in range(300):
+        ring.write(np.ones((279, 2), dtype=np.float32))  # ~256 * 1.0884
+        outputs.append(tap.read(ring, BLOCK))
+    tail = np.concatenate(outputs[5:])
+    assert np.all(tail == 1.0)
+    assert tap.underruns == 0 and tap.drops == 0
+    assert base * 0.95 <= tap.ratio <= base * 1.05
+
+
+def test_tap_bridges_nominal_rate_mismatch_44k1_to_48k():
+    # The opposite direction: 44100-rate mic ring consumed by a 48000-rate
+    # cable callback (base_ratio ~0.919).
+    from discrod.audio.engine import _ServoTap
+    from discrod.audio.ringbuffer import RingBuffer
+    base = 44100.0 / 48000.0
+    tap = _ServoTap(2, 8 * BLOCK, 24 * BLOCK, 128, 0.05, 0.02, 0.05,
+                    base_ratio=base)
+    ring = RingBuffer(48000, 2)
+    ring.write(np.full((tap.prime_frames, 2), 0.5, dtype=np.float32))
+    outputs = []
+    for _ in range(300):
+        ring.write(np.full((235, 2), 0.5, dtype=np.float32))  # ~256 * 0.919
+        outputs.append(tap.read(ring, BLOCK))
+    tail = np.concatenate(outputs[5:])
+    assert np.all(tail == 0.5)
+    assert tap.underruns == 0 and tap.drops == 0
+
+
 def test_config_roundtrip_monitor_mic():
     cfg = AppConfig(monitor_mic=True, monitor_device={"name": "Phones",
                                                       "hostapi": "WASAPI"})

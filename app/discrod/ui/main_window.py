@@ -490,9 +490,18 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.engine.running:
             mic_g = self.engine.mic_underruns + self.engine.mic_drops
             mon_g = self.engine.monitor_underruns + self.engine.monitor_drops
+            rate = f"{self.engine.sample_rate} Hz"
+            extras = []
+            in_rate = self.engine.input_stream_rate
+            mon_rate = self.engine.monitor_stream_rate
+            if in_rate and in_rate != self.engine.sample_rate:
+                extras.append(f"mic {in_rate}")
+            if mon_rate and mon_rate != self.engine.sample_rate:
+                extras.append(f"mon {mon_rate}")
+            if extras:
+                rate += " (" + ", ".join(extras) + ")"
             self.stats_label.setText(
-                f"{self.engine.sample_rate} Hz · glitches mic {mic_g} / "
-                f"monitor {mon_g}")
+                f"{rate} · glitches mic {mic_g} / monitor {mon_g}")
         else:
             self.stats_label.setText("")
 

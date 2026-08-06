@@ -67,7 +67,8 @@ class _ServoTap:
     """
 
     def __init__(self, channels: int, prime_frames: int, max_fill: int,
-                 fade: int, gain: float, alpha: float, span: float):
+                 fade: int, gain: float, alpha: float, span: float,
+                 base_ratio: float = 1.0):
         self.channels = channels
         self.prime_frames = prime_frames
         self.max_fill = max_fill
@@ -75,6 +76,12 @@ class _ServoTap:
         self.gain = gain
         self.alpha = alpha
         self.span = span
+        # Nominal input-frames-per-output-frame. 1.0 when both sides run the
+        # same sample rate; when a device could not open at the engine rate
+        # its stream runs at its own rate and this carries the conversion
+        # (e.g. 48000-rate ring consumed by a 44100-rate callback ->
+        # 48000/44100). The servo trims around this center.
+        self.base_ratio = base_ratio
         self.underruns = 0
         self.drops = 0
         self.reset()
@@ -82,7 +89,7 @@ class _ServoTap:
     def reset(self) -> None:
         self.primed = False
         self.fade_in = True
-        self.ratio = 1.0
+        self.ratio = self.base_ratio
         self.phase = 0.0
         self.carry = np.zeros((2, self.channels), dtype=np.float32)
 
@@ -107,12 +114,15 @@ class _ServoTap:
             self.fade_in = True  # dropped frames = discontinuity
             self.drops += 1
 
-        # Servo: occupancy error -> smoothed, clamped consume ratio.
+        # Servo: occupancy error -> smoothed consume ratio, clamped around
+        # the nominal rate-conversion center.
         err = (avail - self.prime_frames) / float(self.prime_frames)
         err = max(-1.0, min(1.0, err))
-        target = 1.0 + err * self.gain
+        target = self.base_ratio * (1.0 + err * self.gain)
         ratio = self.ratio + self.alpha * (target - self.ratio)
-        ratio = max(1.0 - self.span, min(1.0 + self.span, ratio))
+        lo = self.base_ratio * (1.0 - self.span)
+        hi = self.base_ratio * (1.0 + self.span)
+        ratio = max(lo, min(hi, ratio))
         self.ratio = ratio
 
         # Fractional-phase linear resampler. Positions are measured in input
@@ -199,6 +209,11 @@ class AudioEngine:
             self.SERVO_RANGE)
         self.monitor_enabled = False
         self.monitor_mic = False
+        # Actual rates the input/monitor streams opened at (None when the
+        # stream isn't running); differ from sample_rate only when a device
+        # couldn't open at the engine rate and its tap bridges the ratio.
+        self.input_stream_rate = None
+        self.monitor_stream_rate = None
 
         # Default channels: a mic bus and a soundboard bus.
         self.mic_channel = Channel("Microphone", sample_rate, channels, KIND_MIC)
@@ -434,6 +449,27 @@ class AudioEngine:
 
         self.set_sample_rate(self._negotiate_sample_rate())
         in_channels = self._negotiated_input_channels()
+
+        # Per-stream rates: devices that cannot open at the engine rate run
+        # at their own rate, with the ring taps carrying the conversion.
+        input_rate = None
+        if self.input_device is not None:
+            input_rate = self._compatible_rate(self.input_device, "input",
+                                               in_channels)
+        monitor_rate = None
+        if self.monitor_device is not None:
+            monitor_rate = self._compatible_rate(self.monitor_device,
+                                                 "output", self.channels)
+        self.input_stream_rate = input_rate
+        self.monitor_stream_rate = monitor_rate
+        # Mic ring holds input-rate frames consumed by the engine-rate cable
+        # callback; monitor ring holds engine-rate frames consumed by the
+        # monitor-rate callback.
+        self._mic_tap.base_ratio = ((input_rate / self.sample_rate)
+                                    if input_rate else 1.0)
+        self._monitor_tap.base_ratio = ((self.sample_rate / monitor_rate)
+                                        if monitor_rate else 1.0)
+
         self.mic_ring.clear()
         self._mic_tap.reset()
         self._mic_tap.reset_counters()
@@ -450,7 +486,7 @@ class AudioEngine:
         try:
             if self.input_device is not None:
                 input_stream = sd.InputStream(
-                    device=self.input_device, samplerate=self.sample_rate,
+                    device=self.input_device, samplerate=input_rate,
                     blocksize=self.block_size, channels=in_channels,
                     dtype="float32", callback=self._input_callback,
                     latency="low",
@@ -466,7 +502,7 @@ class AudioEngine:
                 # cable path can't, and the extra host slack absorbs the
                 # cable-callback burstiness that clicks at "low".
                 monitor_stream = sd.OutputStream(
-                    device=self.monitor_device, samplerate=self.sample_rate,
+                    device=self.monitor_device, samplerate=monitor_rate,
                     blocksize=self.block_size, channels=self.channels,
                     dtype="float32", callback=self._monitor_callback,
                     latency="high",
@@ -504,13 +540,24 @@ class AudioEngine:
         """
         rate = self.sample_rate
         candidates = [rate]
-        try:
-            info = sd.query_devices(self.output_device, "output")
-            native = int(info["default_samplerate"])
-            if native not in candidates:
-                candidates.append(native)
-        except Exception:
-            pass
+
+        def add_native(device, kind):
+            try:
+                info = sd.query_devices(device, kind)
+                native = int(info["default_samplerate"])
+                if native not in candidates:
+                    candidates.append(native)
+            except Exception:
+                pass
+
+        add_native(self.output_device, "output")
+        if self.monitor_device is not None:
+            add_native(self.monitor_device, "output")
+        if self.input_device is not None:
+            add_native(self.input_device, "input")
+        for fallback in (48000, 44100):
+            if fallback not in candidates:
+                candidates.append(fallback)
         for candidate in candidates:
             try:
                 sd.check_output_settings(
@@ -528,7 +575,41 @@ class AudioEngine:
                 return candidate
             except Exception:
                 continue
+        # No single rate satisfies every device. Fall back to a rate the
+        # CABLE accepts (it feeds Discord, so it wins); the mic and monitor
+        # streams then open at their own compatible rates and their servo
+        # taps bridge the nominal conversion (see start()).
+        for candidate in candidates:
+            try:
+                sd.check_output_settings(
+                    device=self.output_device, samplerate=candidate,
+                    channels=self.channels, dtype="float32")
+                return candidate
+            except Exception:
+                continue
         return rate
+
+    def _compatible_rate(self, device, kind: str, channels: int) -> int:
+        """Rate to open ``device`` with: the engine rate when it accepts it,
+        else the device's own native rate (nominal mismatch is bridged by the
+        servo taps' base_ratio)."""
+        try:
+            if kind == "input":
+                sd.check_input_settings(
+                    device=device, samplerate=self.sample_rate,
+                    channels=channels, dtype="float32")
+            else:
+                sd.check_output_settings(
+                    device=device, samplerate=self.sample_rate,
+                    channels=channels, dtype="float32")
+            return self.sample_rate
+        except Exception:
+            pass
+        try:
+            info = sd.query_devices(device, kind)
+            return int(info["default_samplerate"])
+        except Exception:
+            return self.sample_rate
 
     def _negotiated_input_channels(self) -> int:
         """Channel count to open the capture device with (mono mics are common
