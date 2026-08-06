@@ -6,8 +6,9 @@ Responsibilities:
   * Sum channels to a master bus and write to the output device.
 
 Routing for Discord: set the engine's **output device** to the render side of
-our virtual audio driver (``Discrod Virtual Cable``).  Discord then selects the
-driver's **capture** endpoint as its microphone, receiving mic + clips with all
+a signed virtual cable (e.g. VB-CABLE's ``CABLE Input``; see
+:mod:`discrod.audio.cables` for auto-detection).  Discord then selects the
+cable's **capture** endpoint as its microphone, receiving mic + clips with all
 processing applied.  Optionally a second output stream can feed local monitoring
 (headphones) so you hear what you send.
 
@@ -16,12 +17,12 @@ but all mixing math is plain numpy so it can be unit-tested without hardware via
 :meth:`render_block`.
 
 Live-stream design notes:
-  * The mic and the output run as two free-running PortAudio streams on
-    independent device clocks, decoupled by a ring buffer.  The output side
-    only starts consuming once the ring holds ``_prime_frames`` (a few blocks
-    of slack against callback jitter); an underrun re-enters the priming state
-    and clock drift is bounded by dropping the backlog whenever occupancy
-    exceeds ``_max_fill``.
+  * The mic, the output, and the optional monitor run as free-running
+    PortAudio streams on independent device clocks, decoupled by ring
+    buffers.  Every ring crossing is consumed through a ``_ServoTap``:
+    primed against callback jitter, rate-servo-corrected against sustained
+    clock slew (virtual cables have sloppy software clocks), drift-bounded,
+    and declicked at every gap edge.
   * ``render_block`` snapshots the voice list under ``_voices_lock`` and runs
     all DSP *outside* the lock, so a MIDI pad press never waits on a full
     render and the audio callback never blocks on the UI thread beyond the
@@ -44,12 +45,143 @@ from .clip import Clip, Voice, MODE_ONESHOT, MODE_LOOP, MODE_TOGGLE
 from .ringbuffer import RingBuffer
 
 
+class _ServoTap:
+    """Primed, servo-rate-corrected, declicked consumer of a RingBuffer.
+
+    Bridges two free-running audio callbacks on independent clocks. Physical
+    devices drift by ppm, but virtual cables (VB-CABLE, Steam Streaming
+    Microphone) run software clocks that can slew their *real* rate well
+    beyond that and deliver callbacks in bursts. No fixed-ratio consumer
+    survives a sustained slew — the ring must eventually gap (click) or drop
+    (click). Three defenses, applied to every ring crossing:
+
+    * A priming cushion so occupancy never hovers at the threshold where
+      every callback race is an underrun.
+    * An occupancy servo: the consume ratio is continuously nudged (within
+      1±span, via linear-interpolation resampling) to hold the ring near its
+      prime level, turning sustained clock mismatch into an inaudibly small
+      pitch offset instead of periodic gaps.
+    * Declicked edges for whatever still gets through: underruns fade out
+      across the remaining frames, and the first block after a prime or a
+      drift-drop fades in.
+    """
+
+    def __init__(self, channels: int, prime_frames: int, max_fill: int,
+                 fade: int, gain: float, alpha: float, span: float,
+                 base_ratio: float = 1.0):
+        self.channels = channels
+        self.prime_frames = prime_frames
+        self.max_fill = max_fill
+        self.fade = fade
+        self.gain = gain
+        self.alpha = alpha
+        self.span = span
+        # Nominal input-frames-per-output-frame. 1.0 when both sides run the
+        # same sample rate; when a device could not open at the engine rate
+        # its stream runs at its own rate and this carries the conversion
+        # (e.g. 48000-rate ring consumed by a 44100-rate callback ->
+        # 48000/44100). The servo trims around this center.
+        self.base_ratio = base_ratio
+        self.underruns = 0
+        self.drops = 0
+        self.reset()
+
+    def reset(self) -> None:
+        self.primed = False
+        self.fade_in = True
+        self.ratio = self.base_ratio
+        self.phase = 0.0
+        self.carry = np.zeros((2, self.channels), dtype=np.float32)
+
+    def reset_counters(self) -> None:
+        self.underruns = 0
+        self.drops = 0
+
+    def read(self, ring: RingBuffer, frames: int) -> np.ndarray:
+        ch = self.channels
+        avail = ring.available
+        if not self.primed:
+            if avail < self.prime_frames:
+                return np.zeros((frames, ch), dtype=np.float32)
+            self.primed = True
+            self.fade_in = True
+            self.ratio = 1.0
+            self.phase = 0.0
+            self.carry = np.zeros((2, ch), dtype=np.float32)
+        if avail > self.max_fill:
+            ring.drop(avail - self.prime_frames)
+            avail = self.prime_frames
+            self.fade_in = True  # dropped frames = discontinuity
+            self.drops += 1
+
+        # Servo: occupancy error -> smoothed consume ratio, clamped around
+        # the nominal rate-conversion center.
+        err = (avail - self.prime_frames) / float(self.prime_frames)
+        err = max(-1.0, min(1.0, err))
+        target = self.base_ratio * (1.0 + err * self.gain)
+        ratio = self.ratio + self.alpha * (target - self.ratio)
+        lo = self.base_ratio * (1.0 - self.span)
+        hi = self.base_ratio * (1.0 + self.span)
+        ratio = max(lo, min(hi, ratio))
+        self.ratio = ratio
+
+        # Fractional-phase linear resampler. Positions are measured in input
+        # frames relative to the older carry sample; the phase lives in
+        # (ratio-1, 1+ratio) across blocks, hence the two-frame carry.
+        pos = self.phase + ratio * np.arange(frames, dtype=np.float64)
+        idx = np.floor(pos).astype(np.int64)
+        n_read = max(int(idx[-1]) + 1, 0)
+        if avail < n_read:
+            # Underrun: emit the remainder as a fade-out, then silence, and
+            # re-enter priming for one clean gap instead of edge-y crackle.
+            self.primed = False
+            self.underruns += 1
+            out = np.zeros((frames, ch), dtype=np.float32)
+            if avail > 0:
+                tail = ring.read(avail)
+                ramp = np.linspace(1.0, 0.0, avail, dtype=np.float32)
+                out[:avail] = tail * ramp[:, None]
+            self.fade_in = True
+            return out
+        xs = (ring.read(n_read) if n_read
+              else np.zeros((0, ch), dtype=np.float32))
+        arr = np.vstack([self.carry, xs])
+        rows = idx + 1  # carry rows sit at input positions -1 and 0
+        frac = (pos - idx).astype(np.float32)[:, None]
+        block = arr[rows] * (1.0 - frac) + arr[rows + 1] * frac
+        self.carry = arr[-2:].copy()
+        self.phase = self.phase + ratio * frames - n_read
+        if self.fade_in:
+            n = min(self.fade, frames)
+            ramp = np.linspace(0.0, 1.0, n, dtype=np.float32)
+            block[:n] = block[:n] * ramp[:, None]
+            self.fade_in = False
+        return block.astype(np.float32, copy=False)
+
+
 class AudioEngine:
-    #: Ring slack (in blocks) accumulated before the output starts consuming.
-    PRIME_BLOCKS = 4
+    #: Mic ring slack (in blocks) before the output starts consuming. The
+    #: consumer is the virtual cable's callback, whose pacing is at the cable
+    #: driver's mercy (Steam Streaming Microphone in particular is bursty),
+    #: so this needs real depth — ~43 ms at 256/48k, still fine for live
+    #: speech on top of Discord's own buffering.
+    MIC_PRIME_BLOCKS = 8
+    #: Monitor ring slack (in blocks). Deeper still: monitoring tolerates
+    #: latency (~64 ms) that the live path can't.
+    MONITOR_PRIME_BLOCKS = 12
     #: Occupancy (in multiples of the prime level) beyond which the backlog is
     #: dropped to re-bound latency after clock drift.
     MAX_FILL_FACTOR = 3
+    #: Declick ramp length (frames) applied entering/leaving transport gaps.
+    DECLICK_FADE = 128
+    #: Occupancy-servo tuning shared by both ring consumers. GAIN maps a
+    #: rail-to-rail occupancy error onto a ratio offset, ALPHA is the
+    #: one-pole smoothing per block, RANGE clamps the ratio to 1±RANGE.
+    #: ±5% covers even a virtual cable's software-clock slew; real
+    #: corrections sit far below the audibility threshold.
+    SERVO_GAIN = 0.05
+    SERVO_ALPHA = 0.02
+    SERVO_RANGE = 0.05
 
     def __init__(self, sample_rate: int = 48000, block_size: int = 256,
                  channels: int = 2):
@@ -57,10 +189,31 @@ class AudioEngine:
         self.block_size = block_size
         self.channels = channels
 
+        # Both ring crossings (mic capture -> cable callback, cable callback
+        # -> monitor callback) go through servo taps: see _ServoTap.
         self.mic_ring = RingBuffer(sample_rate, channels)  # ~1s of slack
-        self._prime_frames = self.PRIME_BLOCKS * block_size
-        self._max_fill = self._prime_frames * self.MAX_FILL_FACTOR
-        self._mic_primed = False
+        self._mic_tap = _ServoTap(
+            channels, self.MIC_PRIME_BLOCKS * block_size,
+            self.MIC_PRIME_BLOCKS * block_size * self.MAX_FILL_FACTOR,
+            self.DECLICK_FADE, self.SERVO_GAIN, self.SERVO_ALPHA,
+            self.SERVO_RANGE)
+
+        # Local monitoring: a second output (headphones) fed the soundboard
+        # mix at exactly the level it enters the virtual mic, optionally
+        # including the processed mic (monitor_mic) to audition the FX chain.
+        self.monitor_ring = RingBuffer(sample_rate, channels)
+        self._monitor_tap = _ServoTap(
+            channels, self.MONITOR_PRIME_BLOCKS * block_size,
+            self.MONITOR_PRIME_BLOCKS * block_size * self.MAX_FILL_FACTOR,
+            self.DECLICK_FADE, self.SERVO_GAIN, self.SERVO_ALPHA,
+            self.SERVO_RANGE)
+        self.monitor_enabled = False
+        self.monitor_mic = False
+        # Actual rates the input/monitor streams opened at (None when the
+        # stream isn't running); differ from sample_rate only when a device
+        # couldn't open at the engine rate and its tap bridges the ratio.
+        self.input_stream_rate = None
+        self.monitor_stream_rate = None
 
         # Default channels: a mic bus and a soundboard bus.
         self.mic_channel = Channel("Microphone", sample_rate, channels, KIND_MIC)
@@ -78,8 +231,10 @@ class AudioEngine:
 
         self._input_stream = None
         self._output_stream = None
+        self._monitor_stream = None
         self.input_device = None
         self.output_device = None
+        self.monitor_device = None
         self.running = False
         # Invoked (from the thread calling start()) when device negotiation
         # changes the engine sample rate; clip caches must be invalidated.
@@ -105,7 +260,9 @@ class AudioEngine:
         for ch in self.channels_list:
             ch.set_sample_rate(sample_rate)
         self.mic_ring = RingBuffer(sample_rate, self.channels)
-        self._mic_primed = False
+        self._mic_tap.reset()
+        self.monitor_ring = RingBuffer(sample_rate, self.channels)
+        self._monitor_tap.reset()
         if self.on_sample_rate_changed is not None:
             self.on_sample_rate_changed(sample_rate)
 
@@ -181,6 +338,13 @@ class AudioEngine:
 
         any_solo = any(ch.solo for ch in self.channels_list)
 
+        # Monitor mix: the same processed channel blocks that feed the master,
+        # restricted to the soundboard buses (plus the mic when monitor_mic),
+        # so the headphone level tracks the virtual-mic level exactly.
+        monitor = None
+        if self.monitor_enabled:
+            monitor = np.zeros((frames, self.channels), dtype=np.float32)
+
         # Snapshot under the lock, render outside it: the DSP work below is the
         # expensive part and must not serialize against trigger_clip on the
         # UI/MIDI path (priority inversion into the audio callback).
@@ -199,6 +363,9 @@ class AudioEngine:
             if (not any_solo) or ch.solo:
                 if not ch.mute:
                     out += scratch
+                    if monitor is not None and (ch.kind != KIND_MIC
+                                                or self.monitor_mic):
+                        monitor += scratch
 
         # Drop finished voices.
         with self._voices_lock:
@@ -212,29 +379,39 @@ class AudioEngine:
         np.clip(out, -1.0, 1.0, out=out)
         if out.size:
             self.master_meter = float(np.max(np.abs(out)))
+        if monitor is not None:
+            # Mirror the master bus exactly (gain + clip) before handing the
+            # block to the monitor stream's ring.
+            if g != 1.0:
+                monitor *= g
+            np.clip(monitor, -1.0, 1.0, out=monitor)
+            self.monitor_ring.write(monitor)
         return out
 
     def _read_mic(self, frames: int) -> np.ndarray:
-        """Consume mic frames with priming and drift bounding.
+        """Consume mic frames through the mic servo tap (see _ServoTap)."""
+        return self._mic_tap.read(self.mic_ring, frames)
 
-        Until the ring holds ``_prime_frames`` the mic contributes silence,
-        building a slack cushion against callback jitter.  An underrun re-arms
-        priming (one clean gap instead of per-block crackle), and a backlog
-        beyond ``_max_fill`` is dropped so clock drift cannot walk latency up
-        toward the ring capacity.
-        """
-        ring = self.mic_ring
-        avail = ring.available
-        if not self._mic_primed:
-            if avail < self._prime_frames:
-                return np.zeros((frames, self.channels), dtype=np.float32)
-            self._mic_primed = True
-        if avail > self._max_fill:
-            ring.drop(avail - self._prime_frames)
-            avail = self._prime_frames
-        if avail < frames:
-            self._mic_primed = False
-        return ring.read(frames)
+    def _read_monitor(self, frames: int) -> np.ndarray:
+        """Consume monitor frames through its servo tap (see _ServoTap)."""
+        return self._monitor_tap.read(self.monitor_ring, frames)
+
+    # Glitch diagnostics, surfaced in the UI status bar.
+    @property
+    def mic_underruns(self) -> int:
+        return self._mic_tap.underruns
+
+    @property
+    def mic_drops(self) -> int:
+        return self._mic_tap.drops
+
+    @property
+    def monitor_underruns(self) -> int:
+        return self._monitor_tap.underruns
+
+    @property
+    def monitor_drops(self) -> int:
+        return self._monitor_tap.drops
 
     # --- PortAudio callbacks ------------------------------------------------
     def _input_callback(self, indata, frames, time_info, status):  # noqa: D401
@@ -252,32 +429,64 @@ class AudioEngine:
         block = self.render_block(frames)
         outdata[:] = block
 
+    def _monitor_callback(self, outdata, frames, time_info, status):
+        outdata[:] = self._read_monitor(frames)
+
     # --- lifecycle ----------------------------------------------------------
-    def start(self, input_device=None, output_device=None) -> None:
+    def start(self, input_device=None, output_device=None,
+              monitor_device=None) -> None:
         if sd is None:
             raise RuntimeError("sounddevice (PortAudio) is not available")
         if self.running:
             self.stop()
-        # Assign unconditionally: None means "no input" / "default output" for
-        # THIS start, never "keep whatever device a previous start used".
+        # Assign unconditionally: None means "no input" / "default output" /
+        # "no monitor" for THIS start, never "keep whatever device a previous
+        # start used".
         self.input_device = input_device
         self.output_device = output_device
+        self.monitor_device = monitor_device
         self._clear_voices()
 
         self.set_sample_rate(self._negotiate_sample_rate())
         in_channels = self._negotiated_input_channels()
-        self.mic_ring.clear()
-        self._mic_primed = False
 
-        # Construct both streams before starting either, and unwind on any
+        # Per-stream rates: devices that cannot open at the engine rate run
+        # at their own rate, with the ring taps carrying the conversion.
+        input_rate = None
+        if self.input_device is not None:
+            input_rate = self._compatible_rate(self.input_device, "input",
+                                               in_channels)
+        monitor_rate = None
+        if self.monitor_device is not None:
+            monitor_rate = self._compatible_rate(self.monitor_device,
+                                                 "output", self.channels)
+        self.input_stream_rate = input_rate
+        self.monitor_stream_rate = monitor_rate
+        # Mic ring holds input-rate frames consumed by the engine-rate cable
+        # callback; monitor ring holds engine-rate frames consumed by the
+        # monitor-rate callback.
+        self._mic_tap.base_ratio = ((input_rate / self.sample_rate)
+                                    if input_rate else 1.0)
+        self._monitor_tap.base_ratio = ((self.sample_rate / monitor_rate)
+                                        if monitor_rate else 1.0)
+
+        self.mic_ring.clear()
+        self._mic_tap.reset()
+        self._mic_tap.reset_counters()
+        self.monitor_ring.clear()
+        self._monitor_tap.reset()
+        self._monitor_tap.reset_counters()
+
+        # Construct all streams before starting any, and unwind on any
         # failure — a half-started engine must not leak a live input stream
         # that keeps writing the ring behind our back.
         input_stream = None
         output_stream = None
+        monitor_stream = None
         try:
             if self.input_device is not None:
                 input_stream = sd.InputStream(
-                    device=self.input_device, samplerate=self.sample_rate,
+                    device=self.input_device, samplerate=input_rate,
                     blocksize=self.block_size, channels=in_channels,
                     dtype="float32", callback=self._input_callback,
                     latency="low",
@@ -288,11 +497,27 @@ class AudioEngine:
                 dtype="float32", callback=self._output_callback,
                 latency="low",
             )
+            if self.monitor_device is not None:
+                # latency="high": monitoring tolerates buffering the live
+                # cable path can't, and the extra host slack absorbs the
+                # cable-callback burstiness that clicks at "low".
+                monitor_stream = sd.OutputStream(
+                    device=self.monitor_device, samplerate=monitor_rate,
+                    blocksize=self.block_size, channels=self.channels,
+                    dtype="float32", callback=self._monitor_callback,
+                    latency="high",
+                )
             if input_stream is not None:
                 input_stream.start()
+            # Flip monitor_enabled before the output stream runs so the very
+            # first rendered block reaches the monitor ring.
+            self.monitor_enabled = monitor_stream is not None
             output_stream.start()
+            if monitor_stream is not None:
+                monitor_stream.start()
         except Exception:
-            for stream in (input_stream, output_stream):
+            self.monitor_enabled = False
+            for stream in (input_stream, output_stream, monitor_stream):
                 if stream is not None:
                     try:
                         stream.stop()
@@ -302,6 +527,7 @@ class AudioEngine:
             raise
         self._input_stream = input_stream
         self._output_stream = output_stream
+        self._monitor_stream = monitor_stream
         self.running = True
 
     def _negotiate_sample_rate(self) -> int:
@@ -314,13 +540,24 @@ class AudioEngine:
         """
         rate = self.sample_rate
         candidates = [rate]
-        try:
-            info = sd.query_devices(self.output_device, "output")
-            native = int(info["default_samplerate"])
-            if native not in candidates:
-                candidates.append(native)
-        except Exception:
-            pass
+
+        def add_native(device, kind):
+            try:
+                info = sd.query_devices(device, kind)
+                native = int(info["default_samplerate"])
+                if native not in candidates:
+                    candidates.append(native)
+            except Exception:
+                pass
+
+        add_native(self.output_device, "output")
+        if self.monitor_device is not None:
+            add_native(self.monitor_device, "output")
+        if self.input_device is not None:
+            add_native(self.input_device, "input")
+        for fallback in (48000, 44100):
+            if fallback not in candidates:
+                candidates.append(fallback)
         for candidate in candidates:
             try:
                 sd.check_output_settings(
@@ -331,10 +568,48 @@ class AudioEngine:
                         device=self.input_device, samplerate=candidate,
                         channels=self._negotiated_input_channels(),
                         dtype="float32")
+                if self.monitor_device is not None:
+                    sd.check_output_settings(
+                        device=self.monitor_device, samplerate=candidate,
+                        channels=self.channels, dtype="float32")
+                return candidate
+            except Exception:
+                continue
+        # No single rate satisfies every device. Fall back to a rate the
+        # CABLE accepts (it feeds Discord, so it wins); the mic and monitor
+        # streams then open at their own compatible rates and their servo
+        # taps bridge the nominal conversion (see start()).
+        for candidate in candidates:
+            try:
+                sd.check_output_settings(
+                    device=self.output_device, samplerate=candidate,
+                    channels=self.channels, dtype="float32")
                 return candidate
             except Exception:
                 continue
         return rate
+
+    def _compatible_rate(self, device, kind: str, channels: int) -> int:
+        """Rate to open ``device`` with: the engine rate when it accepts it,
+        else the device's own native rate (nominal mismatch is bridged by the
+        servo taps' base_ratio)."""
+        try:
+            if kind == "input":
+                sd.check_input_settings(
+                    device=device, samplerate=self.sample_rate,
+                    channels=channels, dtype="float32")
+            else:
+                sd.check_output_settings(
+                    device=device, samplerate=self.sample_rate,
+                    channels=channels, dtype="float32")
+            return self.sample_rate
+        except Exception:
+            pass
+        try:
+            info = sd.query_devices(device, kind)
+            return int(info["default_samplerate"])
+        except Exception:
+            return self.sample_rate
 
     def _negotiated_input_channels(self) -> int:
         """Channel count to open the capture device with (mono mics are common
@@ -350,7 +625,9 @@ class AudioEngine:
 
     def stop(self) -> None:
         self.running = False
-        for stream in (self._input_stream, self._output_stream):
+        self.monitor_enabled = False
+        for stream in (self._input_stream, self._output_stream,
+                       self._monitor_stream):
             if stream is not None:
                 try:
                     stream.stop()
@@ -359,6 +636,7 @@ class AudioEngine:
                     pass
         self._input_stream = None
         self._output_stream = None
+        self._monitor_stream = None
 
     # --- config -------------------------------------------------------------
     def to_dict(self) -> dict:

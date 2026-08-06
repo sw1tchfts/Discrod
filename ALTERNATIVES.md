@@ -6,6 +6,16 @@ costs.  Bottom line: **there is no supported way to create a Windows virtual
 microphone without a kernel driver** — the only real question is *whose
 signature* is on the driver in the path.
 
+> **Decision (Aug 2026): ship on an already-signed cable — VB-CABLE first.**
+> Users want plug-and-play, not machine configuration; the signed-cable route
+> is the only one that is supported, anti-cheat-safe, and zero-setup today.
+> The custom kernel driver (`driver/`) and the experimental injection APO
+> (`apo/`) were removed from the tree — both survive in git history if a
+> first-party transport is ever wanted again (the realistic revival path is
+> the driver + attestation signing, per the analysis below). The app
+> auto-detects installed cables — see `cables.py` — and the roadmap installer
+> bundles VB-CABLE under its vendor-blessed terms.
+
 ## Verified dead ends
 
 - **User-mode virtual audio endpoint API: does not exist.** Windows 11 has a
@@ -38,6 +48,17 @@ comparable to or worse than the driver.  Every commercial competitor
 looked at this trade and shipped a **signed virtual device driver** instead —
 the architecture in `driver/` is the industry-standard one.
 
+### Update: the injection APO was built, then removed with the cable pivot
+
+Because it was the *only* pure-software route meeting a hard "no driver"
+requirement, the injection APO was fully implemented (portable C++ core with
+sample-for-sample parity against the app's Python DSP; only the Windows COM
+shell and registry attach were never proven on real Windows). It was removed
+along with `driver/` when the project pivoted to signed cables: the
+trade-offs above never improved, and the plug-and-play goal made them moot.
+The implementation lives in git history (branch history of PR #3) if ever
+worth revisiting.
+
 ## Piggybacking an already-signed virtual device
 
 The app can output into *any* render endpoint, so any signed loopback pair on
@@ -51,6 +72,13 @@ the machine works as the cable with zero code changes:
 | **VB-CABLE** | Cleanest third-party cable | Donationware with an explicit vendor-blessed bundling path (attribution + donation notice). No companion app in the data path. |
 | Voicemod / NVIDIA Broadcast | ✗ | Their virtual mics accept no third-party injection (Broadcast also requires RTX hardware). |
 | Open-source signed cables | ✗ (none exist) | SAR unsigned/stale; Scream needs test mode on Win11 and is network-oriented; VAC trial watermarks audio; VirtualDrivers/Virtual-Audio-Driver publishes only test-signed betas (sells signed custom builds). |
+
+These signed options are also the **anti-cheat-safe** route: no test-signing
+mode, no Secure Boot changes, no `DisableProtectedAudioDG` downgrade — none of
+the machine states that make Riot Vanguard refuse to launch (VAN9001/VAN9003)
+or that EasyAntiCheat/BattlEye object to (as of Aug 2026 — vendors change
+enforcement, so check their current guidance). This is the transport the
+product now ships on.
 
 ## No-driver approximations
 
@@ -70,8 +98,8 @@ the machine works as the cable with zero code changes:
 
 ## Recommendation
 
-For this project: keep `driver/` (test-signed for development, attestation
-signing if it ever ships to others), and treat existing signed endpoints as
-free wins — the device picker already lists them, so a Steam Streaming
-Microphone or Wave Link install works today by just selecting it as
-**Virtual mic out**.
+Adopted (see the decision note at the top): ship on signed cables, VB-CABLE
+first, with the app auto-detecting whatever signed loopback is already
+installed. If a first-party transport is ever justified (branding, support
+control), the path is reviving `driver/` from git history and paying for EV +
+attestation signing — not the APO.

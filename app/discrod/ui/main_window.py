@@ -18,6 +18,7 @@ from PySide6 import QtCore, QtWidgets
 
 from .. import audio as audio_mod
 from ..audio import AudioEngine, list_devices
+from ..audio.cables import pick_virtual_cable
 from ..audio.clip import MODE_ONESHOT, MODE_GATE, MODE_LOOP, MODE_TOGGLE
 from ..midi import MidiInput, list_ports, note_name
 from ..mapping import PadBank, PadMapping, Controller
@@ -47,6 +48,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._build_ui()
         self._populate_devices()
+        self.hear_mic_check.setChecked(bool(self.cfg.monitor_mic))
         self._reload_pad_table()
         self._build_mixer()
         # Decode mapped clips up front so the first pad press never blocks the
@@ -64,23 +66,66 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setCentralWidget(central)
         root = QtWidgets.QVBoxLayout(central)
 
-        # Toolbar row.
+        # Device pickers: a compact 2x2 grid instead of one long toolbar row.
+        # Combos must never size to their longest entry — Windows device
+        # names ("CABLE Input (VB-Audio Virtual Cable) [Windows DirectSound]")
+        # would force an enormous minimum window width. The closed box elides;
+        # the dropdown list still shows full names.
+        def compact(combo):
+            combo.setSizeAdjustPolicy(
+                QtWidgets.QComboBox.SizeAdjustPolicy
+                .AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumContentsLength(14)
+            combo.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding,
+                                QtWidgets.QSizePolicy.Policy.Fixed)
+            # The closed box clips long device names; keep the full text
+            # reachable as a hover tooltip. The monitor combo's descriptive
+            # tooltip is preserved until a real selection replaces it.
+            combo.currentTextChanged.connect(
+                lambda text, c=combo: c.setToolTip(text) if text else None)
+            return combo
+
+        self.input_combo = compact(QtWidgets.QComboBox())
+        self.output_combo = compact(QtWidgets.QComboBox())
+        self.monitor_combo = compact(QtWidgets.QComboBox())
+        self.monitor_combo.setToolTip(
+            "Local monitoring output (headphones): hear the soundboard at\n"
+            "exactly the level it enters the virtual mic. Pick your\n"
+            "headphones here — not the virtual cable.")
+        self.midi_combo = compact(QtWidgets.QComboBox())
+
+        grid = QtWidgets.QGridLayout()
+        grid.setHorizontalSpacing(12)
+        grid.addWidget(QtWidgets.QLabel("Mic:"), 0, 0)
+        grid.addWidget(self.input_combo, 0, 1)
+        grid.addWidget(QtWidgets.QLabel("Virtual mic out:"), 0, 2)
+        grid.addWidget(self.output_combo, 0, 3)
+        grid.addWidget(QtWidgets.QLabel("Monitor:"), 1, 0)
+        grid.addWidget(self.monitor_combo, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("MIDI:"), 1, 2)
+        grid.addWidget(self.midi_combo, 1, 3)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(3, 1)
+        root.addLayout(grid)
+
+        # Control row: rescan + monitor toggle + Start.
         bar = QtWidgets.QHBoxLayout()
-        self.input_combo = QtWidgets.QComboBox()
-        self.output_combo = QtWidgets.QComboBox()
-        self.midi_combo = QtWidgets.QComboBox()
-        bar.addWidget(QtWidgets.QLabel("Mic:"))
-        bar.addWidget(self.input_combo, 1)
-        bar.addWidget(QtWidgets.QLabel("Virtual mic out:"))
-        bar.addWidget(self.output_combo, 1)
-        bar.addWidget(QtWidgets.QLabel("MIDI:"))
-        bar.addWidget(self.midi_combo, 1)
         self.refresh_btn = QtWidgets.QPushButton("⟳")
         self.refresh_btn.setToolTip("Rescan devices")
+        self.refresh_btn.setFixedWidth(32)
         self.refresh_btn.clicked.connect(self._populate_devices)
         bar.addWidget(self.refresh_btn)
+        self.hear_mic_check = QtWidgets.QCheckBox("Hear mic FX")
+        self.hear_mic_check.setToolTip(
+            "Include your processed microphone in the monitor output so you\n"
+            "can audition the gate/compressor/EQ. Use headphones — speakers\n"
+            "will feed back into the mic. Toggles live while running.")
+        self.hear_mic_check.toggled.connect(self._on_hear_mic_toggled)
+        bar.addWidget(self.hear_mic_check)
+        bar.addStretch(1)
         self.start_btn = QtWidgets.QPushButton("Start")
         self.start_btn.setCheckable(True)
+        self.start_btn.setMinimumWidth(110)
         self.start_btn.toggled.connect(self._toggle_engine)
         bar.addWidget(self.start_btn)
         root.addLayout(bar)
@@ -125,6 +170,10 @@ class MainWindow(QtWidgets.QMainWindow):
         split.setSizes([520, 480])
 
         self.statusBar().showMessage("Stopped")
+        # Permanent right-side readout: negotiated rate + transport glitch
+        # counters, for diagnosing clock/rate trouble without guesswork.
+        self.stats_label = QtWidgets.QLabel("")
+        self.statusBar().addPermanentWidget(self.stats_label)
 
     def _build_mixer(self):
         # Clear existing.
@@ -179,6 +228,11 @@ class MainWindow(QtWidgets.QMainWindow):
         for idx, name, api in outputs:
             label = f"{name} [{api}]" if api else name
             self.output_combo.addItem(label, (idx, name, api))
+        self.monitor_combo.clear()
+        self.monitor_combo.addItem("(none)", None)
+        for idx, name, api in outputs:
+            label = f"{name} [{api}]" if api else name
+            self.monitor_combo.addItem(label, (idx, name, api))
         self.midi_combo.clear()
         self.midi_combo.addItem("(none)", None)
         for name in list_ports():
@@ -233,9 +287,37 @@ class MainWindow(QtWidgets.QMainWindow):
 
         select_audio(self.input_combo, self.cfg.input_device)
         select_audio(self.output_combo, self.cfg.output_device)
+        select_audio(self.monitor_combo, self.cfg.monitor_device)
         select_midi(self.midi_combo, self.cfg.midi_port)
+        if self.cfg.output_device is None:
+            self._auto_select_cable()
+
+    def _auto_select_cable(self):
+        # First run (no saved output device): if a known signed virtual cable
+        # is already installed, select its render endpoint so the app works
+        # without the user studying device names.  Any later explicit choice
+        # is persisted and wins on subsequent launches.
+        outputs = [self.output_combo.itemData(i)
+                   for i in range(self.output_combo.count())
+                   if self.output_combo.itemData(i) is not None]
+        match = pick_virtual_cable(outputs)
+        if match is None:
+            return
+        for i in range(self.output_combo.count()):
+            data = self.output_combo.itemData(i)
+            if data is not None and data[0] == match.device[0]:
+                self.output_combo.setCurrentIndex(i)
+                break
+        self.statusBar().showMessage(
+            f"Auto-selected {match.product.product} as virtual mic out — in "
+            f"Discord, set the input device to {match.product.discord_mic}",
+            15000)
 
     # --- engine -------------------------------------------------------------
+    def _on_hear_mic_toggled(self, on):
+        # Plain flag read by render_block each block — safe to flip live.
+        self.engine.monitor_mic = bool(on)
+
     def _toggle_engine(self, on):
         if on:
             def device_index(combo):
@@ -245,6 +327,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.engine.start(
                     input_device=device_index(self.input_combo),
                     output_device=device_index(self.output_combo),
+                    monitor_device=device_index(self.monitor_combo),
                 )
                 port = self.midi_combo.currentData()
                 if port:
@@ -433,6 +516,23 @@ class MainWindow(QtWidgets.QMainWindow):
             import numpy as np
             db = max(-60.0, 20.0 * float(np.log10(peak)))
         self.master_meter.setValue(int((db + 60) / 60 * 100))
+        if self.engine.running:
+            mic_g = self.engine.mic_underruns + self.engine.mic_drops
+            mon_g = self.engine.monitor_underruns + self.engine.monitor_drops
+            rate = f"{self.engine.sample_rate} Hz"
+            extras = []
+            in_rate = self.engine.input_stream_rate
+            mon_rate = self.engine.monitor_stream_rate
+            if in_rate and in_rate != self.engine.sample_rate:
+                extras.append(f"mic {in_rate}")
+            if mon_rate and mon_rate != self.engine.sample_rate:
+                extras.append(f"mon {mon_rate}")
+            if extras:
+                rate += " (" + ", ".join(extras) + ")"
+            self.stats_label.setText(
+                f"{rate} · glitches mic {mic_g} / monitor {mon_g}")
+        else:
+            self.stats_label.setText("")
 
     def closeEvent(self, event):
         self.midi.close()
@@ -450,6 +550,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.cfg.input_device = device_value(self.input_combo)
         self.cfg.output_device = device_value(self.output_combo)
+        self.cfg.monitor_device = device_value(self.monitor_combo)
+        self.cfg.monitor_mic = self.hear_mic_check.isChecked()
         self.cfg.midi_port = self.midi_combo.currentData()
         self.cfg.engine = self.engine.to_dict()
         self.cfg.bank = self.bank.to_dict()

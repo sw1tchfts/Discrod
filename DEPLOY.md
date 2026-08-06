@@ -1,91 +1,48 @@
-# Deploying Discrod (self-contained: our own virtual cable driver)
+# Deploying Discrod (signed virtual cable: VB-CABLE)
 
-This is the end-to-end path from a clone of this repo to talking in Discord
-through the processed virtual microphone, using **our own kernel driver** —
-no VB-CABLE or other third-party cable involved.
+The end-to-end path from a clone of this repo to talking in Discord through
+the processed virtual microphone. The transport is an **already-signed
+virtual audio cable** — no custom drivers, no test-signing, no system
+modifications, and therefore nothing that bothers kernel anti-cheat
+(Vanguard, EasyAntiCheat, BattlEye: as of Aug 2026 those object to
+*unsigned-dev machine state*, not to ordinary signed audio devices).
 
 ```
  MIDI keys ─► Discrod app (gate/comp/EQ, soundboard mix)
                    │ writes to
                    ▼
- Discrod Virtual Cable (Speakers)  ── kernel loopback ──►  Discrod Virtual Cable (Microphone)
-                                                                   │ selected as input in
-                                                                   ▼
-                                                                Discord
+ CABLE Input (render)  ── signed loopback ──►  CABLE Output (capture)
+                                                    │ selected as input in
+                                                    ▼
+                                                 Discord
 ```
 
-Two machines-worth of roles are involved even if they're the same PC: a **build
-machine** (Visual Studio + WDK) and a **test machine** where the driver runs.
-For personal use these are usually the same box; just know that test-signing
-weakens the kernel's signature policy, so prefer a machine/VM you're
-comfortable rebooting and debugging.
+## 1. Install VB-CABLE (one time)
 
-> **Honest status:** the driver source is structurally complete and passes a
-> mock-portcls link harness, but it has **never been compiled with a real WDK
-> or loaded on real Windows**. Expect the first build to surface issues to fix
-> on-device — that's the normal driver bring-up loop, and `driver/docs/BUILD.md`
-> has the debugging notes.
+1. Download the driver pack from <https://vb-audio.com/Cable/>.
+2. Extract, right-click `VBCABLE_Setup_x64.exe` → **Run as administrator**.
+3. Reboot if the installer asks.
 
-## 1. Prerequisites (one-time)
+VB-CABLE is donationware — if it serves you well,
+[support the author](https://vb-audio.com/Cable/).
 
-On the build machine:
+After install, *Settings → System → Sound* lists **CABLE Input** under Output
+and **CABLE Output** under Input.
 
-1. **Visual Studio 2022** with the *Desktop development with C++* workload.
-2. **Windows SDK** + **Windows Driver Kit (WDK)** matching your VS version,
-   including the WDK Visual Studio extension
-   (<https://learn.microsoft.com/windows-hardware/drivers/download-the-wdk>).
-3. **Python 3.10+** for the app.
+> **Already have a signed cable?** The app also auto-detects the **Steam
+> Streaming Microphone** (installed by Steam Remote Play), **Elgato Wave
+> Link**, and **VoiceMeeter** — any of them works with zero extra installs.
+> See [`ALTERNATIVES.md`](ALTERNATIVES.md).
 
-On the test machine:
+## 2. Run the app
 
-4. Ability to enable **test-signing**. If Secure Boot is enabled in firmware,
-   `bcdedit /set testsigning on` is blocked — disable Secure Boot first (you
-   can re-enable it after switching to attestation-signed builds).
+Double-click **`start-discrod.bat`** in the repo root — it creates the
+virtual environment and installs dependencies on first run (and re-installs
+them automatically whenever `requirements.txt` changes), then launches the
+app. Requires [Python 3.10+](https://www.python.org/downloads/) installed
+with *Add python.exe to PATH* ticked.
 
-## 2. Build the driver
-
-From a *Developer PowerShell for VS 2022*:
-
-```powershell
-cd driver
-msbuild DiscrodAudio.vcxproj /p:Configuration=Debug /p:Platform=x64
-```
-
-The package (`DiscrodAudio.sys`, `.inf`, `.cat`) lands in
-`driver\x64\Debug\DiscrodAudio\`.
-
-## 3. Sign + install (scripted)
-
-From an **elevated** Developer PowerShell on the test machine:
-
-```powershell
-cd driver
-powershell -ExecutionPolicy Bypass -File scripts\install-driver.ps1 -Build
-```
-
-The script does, in order: build (because of `-Build`), create + trust a
-self-signed test certificate on first run, sign the `.sys`, regenerate and sign
-the catalog, verify test-signing boot mode, stage the package with `pnputil`,
-and create the root-enumerated device node (`root\DiscrodAudio`) via
-`devgen`/`devcon`.
-
-Two-step first run: if test-signing was off, the script enables it and stops —
-**reboot, rerun the same command**, and it proceeds to install.
-
-Prefer manual steps or hit a corner case? Every individual command is in
-`driver/docs/BUILD.md`.
-
-### Verify
-
-*Settings → System → Sound* should now list:
-
-- **Discrod Virtual Cable (Speakers)** under Output
-- **Discrod Virtual Cable (Microphone)** under Input
-
-Playing any audio to the Speakers side should show level on the Microphone
-side's meter. Nothing there? See Troubleshooting below.
-
-## 4. Deploy the app
+Manual equivalent:
 
 ```powershell
 cd app
@@ -97,22 +54,28 @@ python -m discrod
 
 In the app's toolbar:
 
-1. **Mic** → your real microphone (pick the *[WASAPI]* entry when offered —
+1. **Virtual mic out** — auto-selected on first run when a known cable is
+   found (the status bar names it). To change it, just pick another device;
+   your choice is saved.
+2. **Mic** → your real microphone (pick the *[WASAPI]* entry when offered —
    lowest latency; the app labels each device with its host API).
-2. **Virtual mic out** → *Discrod Virtual Cable (Speakers)*.
-3. **MIDI** → your keyboard/controller.
-4. Bind pads: **MIDI learn** → choose a clip → hit a key. Set each pad's mode
+3. **Monitor** (optional) → your headphones, to hear the soundboard at the
+   exact level Discord receives it. Tick **Hear mic FX** to also audition
+   your processed mic — headphones only, speakers will feed back into the
+   mic. The toggle works live while the engine runs.
+4. **MIDI** → your keyboard/controller.
+5. Bind pads: **MIDI learn** → choose a clip → hit a key. Set each pad's mode
    (one-shot / gate / loop / toggle), target channel, and gain in the table.
-5. Open **FX…** on the Microphone strip to enable/tune the gate, compressor,
+6. Open **FX…** on the Microphone strip to enable/tune the gate, compressor,
    and EQ. Suggested starting points for voice: gate threshold −45 dB,
    compressor −18 dB at 3:1, EQ flat.
-6. Press **Start**.
+7. Press **Start**.
 
-## 5. Wire up Discord
+## 3. Wire up Discord
 
 *Settings → Voice & Video*:
 
-- **Input Device** → *Discrod Virtual Cable (Microphone)*.
+- **Input Device** → *CABLE Output (VB-Audio Virtual Cable)*.
 - Turn **off** Discord's noise suppression (Krisp) and automatic gain control —
   the app's gate/compressor already does this, and stacking them pumps.
 - Set input mode to *Voice Activity* and calibrate the sensitivity slider while
@@ -121,36 +84,35 @@ In the app's toolbar:
 Do a test in a private voice channel: talk, fire pads, watch the app's master
 meter. If Discord clips, pull the master fader down a few dB.
 
-## 6. Updating
+## 4. Updating
 
-- **App changes:** just `git pull` and restart `python -m discrod`.
-- **Driver changes:** rerun `scripts\install-driver.ps1 -Build`; if endpoints
-  act stale, run `scripts\uninstall-driver.ps1` first, reboot, reinstall.
+App changes: `git pull` and restart `python -m discrod`. The cable never
+needs touching once installed.
 
 ## Uninstall
 
-```powershell
-cd driver
-powershell -ExecutionPolicy Bypass -File scripts\uninstall-driver.ps1
-# add -DisableTestSigning to also restore normal signature enforcement
-```
+Remove VB-CABLE with its own `VBCABLE_Setup_x64.exe` (Remove Driver button,
+as administrator), then reboot. The app itself is just the `app/` folder and
+`%APPDATA%\Discrod\` (config).
 
 ## Troubleshooting
 
 | Symptom | Likely cause / fix |
 |---|---|
-| `bcdedit /set testsigning on` fails with a policy error | Secure Boot is on — disable it in UEFI firmware settings, retry. |
-| Device shows **Code 52** in Device Manager | Signature not trusted: confirm test-signing is active (`bcdedit /enum {current}` shows `testsigning Yes` — needs the post-enable reboot) and the test cert is in *Trusted Root* + *Trusted Publishers* (the install script does this). |
-| Driver installs but **no endpoints appear** | Interface reference strings must match between `DiscrodAudio.inf` and `driver/src/common.h`; check *Windows → Event Viewer → System* for portcls/DiscrodAudio errors. This is the most likely first-bring-up failure — report the event text and iterate. |
-| Endpoints exist but **Discord hears silence** | In the app, confirm output is the cable's *Speakers* side and the engine is running (status bar). Check the master meter moves. In Windows *Sound settings → Microphone (cable)*, confirm the level meter moves while the app runs. |
+| No CABLE devices in Windows sound settings | The installer needs *Run as administrator* and a reboot — redo both. |
+| App didn't auto-select the cable | Press the **⟳** rescan button, or pick *CABLE Input* manually under **Virtual mic out**. |
+| Discord doesn't list CABLE Output | Restart Discord after installing the cable (it snapshots devices at launch). |
+| Discord hears **silence** | Confirm the engine is running (status bar) and the master meter moves; in Windows *Sound settings → CABLE Output*, confirm its level meter moves while the app runs. |
 | **Crackling / dropouts** | Raise the app's block size in `%APPDATA%\Discrod\config.json` (`block_size`: 256 → 512), keep the app on WASAPI devices, and close other exclusive-mode audio apps. |
-| **BSOD** on driver load/start | Grab `C:\Windows\Minidump\*.dmp`, open in WinDbg (`!analyze -v`), and file the stack — the driver has never met real hardware, so a bring-up bug is possible. Test in a VM if you want zero risk to your main machine. |
+| Clicking on the **Monitor** output | The monitor rides ~64 ms behind the live path and a rate servo absorbs up to ±5% clock slew between the cable and your headphones, declicking anything that still slips through. If it persists: **align sample rates to 48000 Hz everywhere** — VB-CABLE's own control panel (its internal rate defaults to 44100 on some installs), plus *Sound Control Panel → Properties → Advanced* for CABLE Input, CABLE Output, and your headphones. The status bar shows the negotiated rate and live glitch counters (`… Hz · glitches mic N / monitor M`) — if the mic counter climbs, the problem is the live path, not the monitor; report which counter moves. Prefer WASAPI entries for all three devices, and raise `block_size` as above. |
 | Pads silent, status bar says a clip can't load | The mapped file moved or is an unsupported format — remap the pad. |
+| `Invalid sample rate [PaErrorCode -9997]` on Start | Your devices disagree on a common rate. The app now negotiates across every selected device (plus 48000/44100 fallbacks) and, when no shared rate exists, opens the mic/monitor at their own rates and converts internally — so update to the latest build first. The status bar shows per-stream rates when they differ (e.g. `48000 Hz (mon 44100)`). Aligning everything to 48000 Hz in Windows' Advanced sound properties is still the cleanest setup. |
+| **Steam Streaming Microphone** glitches / has no WASAPI entry | Expected: Valve's device is an old-style driver (MME/DirectSound only) with a bursty software clock — the servo absorbs a lot of it, but it remains the flakiest cable option. If the glitch counters keep climbing on it, install VB-CABLE; the app auto-prefers VB-CABLE the moment it exists. |
+| Worried about **Vanguard / anti-cheat** | Nothing to revert and nothing to check: this setup makes no machine-integrity changes (no test mode, no Secure Boot change, no protected-process overrides). VB-CABLE is a normally-signed driver, the same category as any hardware vendor's. |
 
 ## Distributing to other people (later)
 
-Test-signing is a per-machine developer mode. To hand this to friends without
-firmware fiddling you need an **EV code-signing certificate** and **attestation
-signing** through the Microsoft Partner Center (Hardware Dev Center); the
-signed package then installs on stock Windows with Secure Boot on. The app side
-can be bundled into a single `Discrod.exe` with PyInstaller at that point.
+The roadmap installer bundles VB-CABLE per its vendor-blessed bundling terms
+(attribution + donation notice), silently installs it, and sets the cable as
+the default *communications* device so Discord picks it up with zero clicks.
+The app side can be bundled into a single `Discrod.exe` with PyInstaller.
