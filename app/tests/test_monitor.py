@@ -173,6 +173,79 @@ def test_resume_after_prime_fades_in():
     assert np.all(again[:, 0] == 1.0)
 
 
+def test_servo_absorbs_slow_writer():
+    # Writer delivers 250 frames per 256-frame read: a sustained ~2.3% clock
+    # slew (VB-CABLE-style). The servo must absorb it with zero gaps - with
+    # the old fixed-ratio consumer this underran periodically (clicking).
+    eng = make_engine()
+    eng.monitor_ring.write(
+        np.ones((eng._monitor_prime_frames, 2), dtype=np.float32))
+    outputs = []
+    for _ in range(300):
+        eng.monitor_ring.write(np.ones((250, 2), dtype=np.float32))
+        outputs.append(eng._read_monitor(BLOCK))
+    tail = np.concatenate(outputs[5:])
+    assert np.all(tail == 1.0)  # constant in -> constant out, no gaps/fades
+    assert eng.monitor_underruns == 0
+
+
+def test_servo_absorbs_fast_writer():
+    # Writer delivers 262 frames per 256-frame read (~2.3% fast): the servo
+    # must consume faster instead of accumulating a backlog and dropping.
+    eng = make_engine()
+    eng.monitor_ring.write(
+        np.ones((eng._monitor_prime_frames, 2), dtype=np.float32))
+    outputs = []
+    for _ in range(300):
+        eng.monitor_ring.write(np.ones((262, 2), dtype=np.float32))
+        outputs.append(eng._read_monitor(BLOCK))
+    tail = np.concatenate(outputs[5:])
+    assert np.all(tail == 1.0)
+    assert eng.monitor_drops == 0
+    assert eng.monitor_ring.available < eng._monitor_max_fill
+
+
+def test_servo_ratio_stays_clamped():
+    # A mismatch beyond the servo's range (here ~22%) degrades to occasional
+    # declicked gaps - the ratio must never chase outside its clamp.
+    eng = make_engine()
+    eng.monitor_ring.write(
+        np.ones((eng._monitor_prime_frames, 2), dtype=np.float32))
+    for _ in range(300):
+        eng.monitor_ring.write(np.ones((200, 2), dtype=np.float32))
+        out = eng._read_monitor(BLOCK)
+        assert np.all(np.isfinite(out))
+        assert np.all(np.abs(out) <= 1.0)
+    lo = 1.0 - AudioEngine.MONITOR_SERVO_RANGE
+    hi = 1.0 + AudioEngine.MONITOR_SERVO_RANGE
+    assert lo <= eng._monitor_ratio <= hi
+    assert eng.monitor_underruns > 0  # degradation is counted, not silent
+
+
+def test_servo_interpolation_preserves_waveform_shape():
+    # A linear ramp through the resampler must stay monotonic (interpolation
+    # correctness; a phase/index bug would produce jumps or repeats).
+    eng = make_engine()
+    n = eng._monitor_prime_frames + 4 * BLOCK
+    ramp = np.linspace(0.0, 1.0, n, dtype=np.float32)
+    eng.monitor_ring.write(np.repeat(ramp[:, None], 2, axis=1))
+    eng._read_monitor(BLOCK)  # first block carries the prime fade-in
+    for _ in range(3):
+        block = eng._read_monitor(BLOCK)
+        diffs = np.diff(block[:, 0])
+        assert np.all(diffs >= 0.0)
+        assert np.max(np.abs(diffs)) < 1e-3  # smooth, no repeats/jumps
+
+
+def test_glitch_counters_reset_and_count():
+    eng = make_engine()
+    assert eng.monitor_underruns == 0
+    eng._monitor_primed = True
+    eng.monitor_ring.write(np.ones((100, 2), dtype=np.float32))
+    eng._read_monitor(BLOCK)  # underrun
+    assert eng.monitor_underruns == 1
+
+
 def test_config_roundtrip_monitor_mic():
     cfg = AppConfig(monitor_mic=True, monitor_device={"name": "Phones",
                                                       "hostapi": "WASAPI"})

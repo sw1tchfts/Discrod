@@ -141,6 +141,10 @@ class MainWindow(QtWidgets.QMainWindow):
         split.setSizes([520, 480])
 
         self.statusBar().showMessage("Stopped")
+        # Permanent right-side readout: negotiated rate + transport glitch
+        # counters, for diagnosing clock/rate trouble without guesswork.
+        self.stats_label = QtWidgets.QLabel("")
+        self.statusBar().addPermanentWidget(self.stats_label)
 
     def _build_mixer(self):
         # Clear existing.
@@ -483,6 +487,14 @@ class MainWindow(QtWidgets.QMainWindow):
             import numpy as np
             db = max(-60.0, 20.0 * float(np.log10(peak)))
         self.master_meter.setValue(int((db + 60) / 60 * 100))
+        if self.engine.running:
+            mic_g = self.engine.mic_underruns + self.engine.mic_drops
+            mon_g = self.engine.monitor_underruns + self.engine.monitor_drops
+            self.stats_label.setText(
+                f"{self.engine.sample_rate} Hz · glitches mic {mic_g} / "
+                f"monitor {mon_g}")
+        else:
+            self.stats_label.setText("")
 
     def closeEvent(self, event):
         self.midi.close()

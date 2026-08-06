@@ -59,6 +59,14 @@ class AudioEngine:
     MONITOR_PRIME_BLOCKS = 12
     #: Declick ramp length (frames) applied entering/leaving monitor gaps.
     MONITOR_FADE = 128
+    #: Occupancy-servo tuning for the monitor's rate-corrected consumer.
+    #: GAIN maps a rail-to-rail occupancy error onto a ratio offset, ALPHA is
+    #: the one-pole smoothing per block, RANGE clamps the ratio to 1±RANGE.
+    #: ±5% covers even VB-CABLE's software-clock slew; real corrections sit
+    #: far below the audibility threshold for sustained pitch offset.
+    MONITOR_SERVO_GAIN = 0.05
+    MONITOR_SERVO_ALPHA = 0.02
+    MONITOR_SERVO_RANGE = 0.05
 
     def __init__(self, sample_rate: int = 48000, block_size: int = 256,
                  channels: int = 2):
@@ -84,6 +92,17 @@ class AudioEngine:
         self._monitor_prime_frames = self.MONITOR_PRIME_BLOCKS * block_size
         self._monitor_max_fill = self._monitor_prime_frames * self.MAX_FILL_FACTOR
         self._monitor_fade_in = True
+        # Servo-resampler state: current consume ratio, fractional read phase,
+        # and the two most recent input frames (interpolation continuity
+        # across blocks; two because the phase may legally dip just below 0).
+        self._monitor_ratio = 1.0
+        self._monitor_phase = 0.0
+        self._monitor_carry = np.zeros((2, channels), dtype=np.float32)
+        # Glitch diagnostics, surfaced in the UI status bar.
+        self.mic_underruns = 0
+        self.mic_drops = 0
+        self.monitor_underruns = 0
+        self.monitor_drops = 0
 
         # Default channels: a mic bus and a soundboard bus.
         self.mic_channel = Channel("Microphone", sample_rate, channels, KIND_MIC)
@@ -134,6 +153,9 @@ class AudioEngine:
         self.monitor_ring = RingBuffer(sample_rate, self.channels)
         self._monitor_primed = False
         self._monitor_fade_in = True
+        self._monitor_ratio = 1.0
+        self._monitor_phase = 0.0
+        self._monitor_carry = np.zeros((2, self.channels), dtype=np.float32)
         if self.on_sample_rate_changed is not None:
             self.on_sample_rate_changed(sample_rate)
 
@@ -277,53 +299,96 @@ class AudioEngine:
         if avail > self._max_fill:
             ring.drop(avail - self._prime_frames)
             avail = self._prime_frames
+            self.mic_drops += 1
         if avail < frames:
             self._mic_primed = False
+            self.mic_underruns += 1
         return ring.read(frames)
 
     def _read_monitor(self, frames: int) -> np.ndarray:
-        """Consume monitor frames: primed, drift-bounded, and declicked.
+        """Consume monitor frames: primed, servo-rate-corrected, declicked.
 
         The monitor ring is written by the cable-output callback and drained
         by the monitor device's callback; the two free-run on independent
-        clocks, and the cable side's pacing can be bursty. Differences from
-        the mic path, both learned from audible clicking:
+        clocks. Physical devices drift by ppm, but a virtual cable's software
+        clock (VB-CABLE especially) can slew its *real* rate well beyond
+        that, and no fixed-ratio consumer survives a sustained slew — the
+        ring must eventually gap (click) or drop (click). Three defenses:
 
         * A deep cushion (_monitor_prime_frames) so occupancy never hovers at
           the threshold where every callback race is an underrun.
-        * Gap edges are ramped: an underrun fades out across whatever frames
-          remain instead of cutting mid-block, and the first block after a
-          prime or a drift-drop fades in. Discontinuities become inaudible.
+        * An occupancy servo: the consume ratio is continuously nudged
+          (within 1±MONITOR_SERVO_RANGE, via linear-interpolation
+          resampling) to hold the ring near its prime level, turning
+          sustained clock mismatch into an inaudible pitch offset instead of
+          periodic gaps.
+        * Declicked edges for whatever still gets through: underruns fade
+          out across the remaining frames, and the first block after a prime
+          or a drift-drop fades in.
         """
         ring = self.monitor_ring
+        ch = self.channels
         avail = ring.available
         if not self._monitor_primed:
             if avail < self._monitor_prime_frames:
-                return np.zeros((frames, self.channels), dtype=np.float32)
+                return np.zeros((frames, ch), dtype=np.float32)
             self._monitor_primed = True
             self._monitor_fade_in = True
+            self._monitor_ratio = 1.0
+            self._monitor_phase = 0.0
+            self._monitor_carry = np.zeros((2, ch), dtype=np.float32)
         if avail > self._monitor_max_fill:
             ring.drop(avail - self._monitor_prime_frames)
             avail = self._monitor_prime_frames
             self._monitor_fade_in = True  # dropped frames = discontinuity
-        if avail < frames:
+            self.monitor_drops += 1
+
+        # Servo: occupancy error -> smoothed, clamped consume ratio.
+        err = ((avail - self._monitor_prime_frames)
+               / float(self._monitor_prime_frames))
+        err = max(-1.0, min(1.0, err))
+        target = 1.0 + err * self.MONITOR_SERVO_GAIN
+        ratio = self._monitor_ratio
+        ratio += self.MONITOR_SERVO_ALPHA * (target - ratio)
+        lo = 1.0 - self.MONITOR_SERVO_RANGE
+        hi = 1.0 + self.MONITOR_SERVO_RANGE
+        ratio = max(lo, min(hi, ratio))
+        self._monitor_ratio = ratio
+
+        # Fractional-phase linear resampler. Positions are measured in input
+        # frames relative to the older carry sample; the phase lives in
+        # (ratio-1, 1+ratio) across blocks, hence the two-frame carry.
+        pos = self._monitor_phase + ratio * np.arange(frames, dtype=np.float64)
+        idx = np.floor(pos).astype(np.int64)
+        n_read = int(idx[-1]) + 1
+        if n_read < 0:
+            n_read = 0
+        if avail < n_read:
             # Underrun: emit the remainder as a fade-out, then silence, and
             # re-enter priming for one clean gap instead of edge-y crackle.
             self._monitor_primed = False
-            out = np.zeros((frames, self.channels), dtype=np.float32)
+            self.monitor_underruns += 1
+            out = np.zeros((frames, ch), dtype=np.float32)
             if avail > 0:
                 tail = ring.read(avail)
                 ramp = np.linspace(1.0, 0.0, avail, dtype=np.float32)
                 out[:avail] = tail * ramp[:, None]
             self._monitor_fade_in = True
             return out
-        block = ring.read(frames)
+        xs = (ring.read(n_read) if n_read
+              else np.zeros((0, ch), dtype=np.float32))
+        arr = np.vstack([self._monitor_carry, xs])
+        rows = idx + 1  # carry rows sit at input positions -1 and 0
+        frac = (pos - idx).astype(np.float32)[:, None]
+        block = arr[rows] * (1.0 - frac) + arr[rows + 1] * frac
+        self._monitor_carry = arr[-2:].copy()
+        self._monitor_phase = self._monitor_phase + ratio * frames - n_read
         if self._monitor_fade_in:
             n = min(self.MONITOR_FADE, frames)
             ramp = np.linspace(0.0, 1.0, n, dtype=np.float32)
-            block[:n] *= ramp[:, None]
+            block[:n] = block[:n] * ramp[:, None]
             self._monitor_fade_in = False
-        return block
+        return block.astype(np.float32, copy=False)
 
     # --- PortAudio callbacks ------------------------------------------------
     def _input_callback(self, indata, frames, time_info, status):  # noqa: D401
@@ -366,6 +431,11 @@ class AudioEngine:
         self.monitor_ring.clear()
         self._monitor_primed = False
         self._monitor_fade_in = True
+        self._monitor_ratio = 1.0
+        self._monitor_phase = 0.0
+        self._monitor_carry = np.zeros((2, self.channels), dtype=np.float32)
+        self.mic_underruns = self.mic_drops = 0
+        self.monitor_underruns = self.monitor_drops = 0
 
         # Construct all streams before starting any, and unwind on any
         # failure — a half-started engine must not leak a live input stream
