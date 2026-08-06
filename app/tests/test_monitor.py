@@ -135,19 +135,22 @@ def test_read_monitor_drops_backlog_after_drift():
         eng.render_block(BLOCK, mic_block=np.zeros((BLOCK, 2), np.float32))
     eng._read_monitor(BLOCK)
     # Backlog was clamped back to the prime level (one block since consumed).
-    assert eng.monitor_ring.available <= eng._monitor_prime_frames
+    assert eng.monitor_ring.available <= eng._monitor_tap.prime_frames
 
 
-def test_monitor_prime_is_deeper_than_mic_prime():
-    # The monitor writer (virtual-cable callback) is bursty; a shallow prime
-    # hovers at the underrun threshold and clicks. Guard the cushion.
+def test_transport_cushions_stay_deep():
+    # Both ring consumers race a virtual cable's bursty callback; shallow
+    # primes hover at the underrun threshold and click. Guard both cushions:
+    # the mic needs real depth (>= 8 blocks), the latency-tolerant monitor
+    # deeper still.
     eng = make_engine()
-    assert eng._monitor_prime_frames >= 3 * eng._prime_frames
+    assert eng._mic_tap.prime_frames >= 8 * eng.block_size
+    assert eng._monitor_tap.prime_frames >= 1.5 * eng._mic_tap.prime_frames
 
 
 def test_underrun_fades_out_and_reprimes():
     eng = make_engine()
-    eng._monitor_primed = True  # force primed with a partial block in the ring
+    eng._monitor_tap.primed = True  # force primed with a partial block in the ring
     eng.monitor_ring.write(np.ones((100, 2), dtype=np.float32))
     out = eng._read_monitor(BLOCK)
     # Remainder fades from full scale to zero, then true silence: no hard edge.
@@ -155,15 +158,15 @@ def test_underrun_fades_out_and_reprimes():
     assert out[99, 0] == 0.0
     assert np.all(out[100:] == 0.0)
     assert np.all(np.abs(np.diff(out[:, 0])) < 0.05)
-    assert eng._monitor_primed is False
+    assert eng._monitor_tap.primed is False
 
 
 def test_resume_after_prime_fades_in():
     eng = make_engine()
     eng.monitor_ring.write(
-        np.ones((eng._monitor_prime_frames, 2), dtype=np.float32))
+        np.ones((eng._monitor_tap.prime_frames, 2), dtype=np.float32))
     block = eng._read_monitor(BLOCK)
-    fade = AudioEngine.MONITOR_FADE
+    fade = AudioEngine.DECLICK_FADE
     # First sample silent, ramp up, then full scale: no click on resume.
     assert block[0, 0] == 0.0
     assert np.all(block[fade:, 0] == 1.0)
@@ -179,7 +182,7 @@ def test_servo_absorbs_slow_writer():
     # the old fixed-ratio consumer this underran periodically (clicking).
     eng = make_engine()
     eng.monitor_ring.write(
-        np.ones((eng._monitor_prime_frames, 2), dtype=np.float32))
+        np.ones((eng._monitor_tap.prime_frames, 2), dtype=np.float32))
     outputs = []
     for _ in range(300):
         eng.monitor_ring.write(np.ones((250, 2), dtype=np.float32))
@@ -194,7 +197,7 @@ def test_servo_absorbs_fast_writer():
     # must consume faster instead of accumulating a backlog and dropping.
     eng = make_engine()
     eng.monitor_ring.write(
-        np.ones((eng._monitor_prime_frames, 2), dtype=np.float32))
+        np.ones((eng._monitor_tap.prime_frames, 2), dtype=np.float32))
     outputs = []
     for _ in range(300):
         eng.monitor_ring.write(np.ones((262, 2), dtype=np.float32))
@@ -202,7 +205,7 @@ def test_servo_absorbs_fast_writer():
     tail = np.concatenate(outputs[5:])
     assert np.all(tail == 1.0)
     assert eng.monitor_drops == 0
-    assert eng.monitor_ring.available < eng._monitor_max_fill
+    assert eng.monitor_ring.available < eng._monitor_tap.max_fill
 
 
 def test_servo_ratio_stays_clamped():
@@ -210,15 +213,15 @@ def test_servo_ratio_stays_clamped():
     # declicked gaps - the ratio must never chase outside its clamp.
     eng = make_engine()
     eng.monitor_ring.write(
-        np.ones((eng._monitor_prime_frames, 2), dtype=np.float32))
+        np.ones((eng._monitor_tap.prime_frames, 2), dtype=np.float32))
     for _ in range(300):
         eng.monitor_ring.write(np.ones((200, 2), dtype=np.float32))
         out = eng._read_monitor(BLOCK)
         assert np.all(np.isfinite(out))
         assert np.all(np.abs(out) <= 1.0)
-    lo = 1.0 - AudioEngine.MONITOR_SERVO_RANGE
-    hi = 1.0 + AudioEngine.MONITOR_SERVO_RANGE
-    assert lo <= eng._monitor_ratio <= hi
+    lo = 1.0 - AudioEngine.SERVO_RANGE
+    hi = 1.0 + AudioEngine.SERVO_RANGE
+    assert lo <= eng._monitor_tap.ratio <= hi
     assert eng.monitor_underruns > 0  # degradation is counted, not silent
 
 
@@ -226,7 +229,7 @@ def test_servo_interpolation_preserves_waveform_shape():
     # A linear ramp through the resampler must stay monotonic (interpolation
     # correctness; a phase/index bug would produce jumps or repeats).
     eng = make_engine()
-    n = eng._monitor_prime_frames + 4 * BLOCK
+    n = eng._monitor_tap.prime_frames + 4 * BLOCK
     ramp = np.linspace(0.0, 1.0, n, dtype=np.float32)
     eng.monitor_ring.write(np.repeat(ramp[:, None], 2, axis=1))
     eng._read_monitor(BLOCK)  # first block carries the prime fade-in
@@ -240,10 +243,40 @@ def test_servo_interpolation_preserves_waveform_shape():
 def test_glitch_counters_reset_and_count():
     eng = make_engine()
     assert eng.monitor_underruns == 0
-    eng._monitor_primed = True
+    eng._monitor_tap.primed = True
     eng.monitor_ring.write(np.ones((100, 2), dtype=np.float32))
     eng._read_monitor(BLOCK)  # underrun
     assert eng.monitor_underruns == 1
+
+
+def test_mic_servo_absorbs_slow_writer():
+    # The live path has the same disease: the mic ring's consumer is the
+    # virtual cable's callback. A sustained ~2.3% slew must produce zero
+    # mic gaps (this is what "glitches mic N" was counting on real hardware).
+    eng = AudioEngine(sample_rate=48000, block_size=BLOCK)
+    eng.mic_ring.write(
+        np.full((eng._mic_tap.prime_frames, 2), 0.5, dtype=np.float32))
+    outputs = []
+    for _ in range(300):
+        eng.mic_ring.write(np.full((250, 2), 0.5, dtype=np.float32))
+        outputs.append(eng.render_block(BLOCK))
+    tail = np.concatenate(outputs[5:])
+    assert np.all(tail == 0.5)
+    assert eng.mic_underruns == 0
+
+
+def test_mic_servo_absorbs_fast_writer():
+    eng = AudioEngine(sample_rate=48000, block_size=BLOCK)
+    eng.mic_ring.write(
+        np.full((eng._mic_tap.prime_frames, 2), 0.5, dtype=np.float32))
+    outputs = []
+    for _ in range(300):
+        eng.mic_ring.write(np.full((262, 2), 0.5, dtype=np.float32))
+        outputs.append(eng.render_block(BLOCK))
+    tail = np.concatenate(outputs[5:])
+    assert np.all(tail == 0.5)
+    assert eng.mic_drops == 0
+    assert eng.mic_ring.available < eng._mic_tap.max_fill
 
 
 def test_config_roundtrip_monitor_mic():

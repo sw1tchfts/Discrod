@@ -456,20 +456,24 @@ def test_ringbuffer_drop_bounds_backlog():
 
 def test_mic_priming_holds_silence_until_target_fill():
     eng = AudioEngine(SR, block_size=64)
-    # Less than the prime target (4 blocks): mic must stay silent.
+    # Less than the prime target: mic must stay silent.
     eng.mic_ring.write(np.full((128, 2), 0.5, dtype=np.float32))
     out = eng.render_block(64)
     assert np.allclose(out, 0.0)
-    # Reaching the target releases the mic path.
-    eng.mic_ring.write(np.full((256, 2), 0.5, dtype=np.float32))
+    # Reaching the target releases the mic path; the first released block
+    # carries the declick fade-in, the next one is at full level.
+    fill = eng._mic_tap.prime_frames
+    eng.mic_ring.write(np.full((fill, 2), 0.5, dtype=np.float32))
+    eng.render_block(64)  # fade-in block
     out = eng.render_block(64)
     assert np.allclose(out, 0.5, atol=1e-6)
 
 
 def test_mic_drift_backlog_is_dropped():
     eng = AudioEngine(SR, block_size=64)
-    target = eng._prime_frames
-    eng.mic_ring.write(np.full((eng._max_fill + 640, 2), 0.5, dtype=np.float32))
+    target = eng._mic_tap.prime_frames
+    eng.mic_ring.write(np.full((eng._mic_tap.max_fill + 640, 2), 0.5,
+                               dtype=np.float32))
     eng.render_block(64)
     # Occupancy was re-bounded to the prime target (minus the frames consumed).
     assert eng.mic_ring.available <= target
