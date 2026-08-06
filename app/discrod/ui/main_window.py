@@ -66,26 +66,53 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setCentralWidget(central)
         root = QtWidgets.QVBoxLayout(central)
 
-        # Toolbar row.
-        bar = QtWidgets.QHBoxLayout()
-        self.input_combo = QtWidgets.QComboBox()
-        self.output_combo = QtWidgets.QComboBox()
-        self.midi_combo = QtWidgets.QComboBox()
-        bar.addWidget(QtWidgets.QLabel("Mic:"))
-        bar.addWidget(self.input_combo, 1)
-        bar.addWidget(QtWidgets.QLabel("Virtual mic out:"))
-        bar.addWidget(self.output_combo, 1)
-        self.monitor_combo = QtWidgets.QComboBox()
+        # Device pickers: a compact 2x2 grid instead of one long toolbar row.
+        # Combos must never size to their longest entry — Windows device
+        # names ("CABLE Input (VB-Audio Virtual Cable) [Windows DirectSound]")
+        # would force an enormous minimum window width. The closed box elides;
+        # the dropdown list still shows full names.
+        def compact(combo):
+            combo.setSizeAdjustPolicy(
+                QtWidgets.QComboBox.SizeAdjustPolicy
+                .AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumContentsLength(14)
+            combo.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding,
+                                QtWidgets.QSizePolicy.Policy.Fixed)
+            # The closed box clips long device names; keep the full text
+            # reachable as a hover tooltip. The monitor combo's descriptive
+            # tooltip is preserved until a real selection replaces it.
+            combo.currentTextChanged.connect(
+                lambda text, c=combo: c.setToolTip(text) if text else None)
+            return combo
+
+        self.input_combo = compact(QtWidgets.QComboBox())
+        self.output_combo = compact(QtWidgets.QComboBox())
+        self.monitor_combo = compact(QtWidgets.QComboBox())
         self.monitor_combo.setToolTip(
             "Local monitoring output (headphones): hear the soundboard at\n"
             "exactly the level it enters the virtual mic. Pick your\n"
             "headphones here — not the virtual cable.")
-        bar.addWidget(QtWidgets.QLabel("Monitor:"))
-        bar.addWidget(self.monitor_combo, 1)
-        bar.addWidget(QtWidgets.QLabel("MIDI:"))
-        bar.addWidget(self.midi_combo, 1)
+        self.midi_combo = compact(QtWidgets.QComboBox())
+
+        grid = QtWidgets.QGridLayout()
+        grid.setHorizontalSpacing(12)
+        grid.addWidget(QtWidgets.QLabel("Mic:"), 0, 0)
+        grid.addWidget(self.input_combo, 0, 1)
+        grid.addWidget(QtWidgets.QLabel("Virtual mic out:"), 0, 2)
+        grid.addWidget(self.output_combo, 0, 3)
+        grid.addWidget(QtWidgets.QLabel("Monitor:"), 1, 0)
+        grid.addWidget(self.monitor_combo, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("MIDI:"), 1, 2)
+        grid.addWidget(self.midi_combo, 1, 3)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(3, 1)
+        root.addLayout(grid)
+
+        # Control row: rescan + monitor toggle + Start.
+        bar = QtWidgets.QHBoxLayout()
         self.refresh_btn = QtWidgets.QPushButton("⟳")
         self.refresh_btn.setToolTip("Rescan devices")
+        self.refresh_btn.setFixedWidth(32)
         self.refresh_btn.clicked.connect(self._populate_devices)
         bar.addWidget(self.refresh_btn)
         self.hear_mic_check = QtWidgets.QCheckBox("Hear mic FX")
@@ -95,8 +122,10 @@ class MainWindow(QtWidgets.QMainWindow):
             "will feed back into the mic. Toggles live while running.")
         self.hear_mic_check.toggled.connect(self._on_hear_mic_toggled)
         bar.addWidget(self.hear_mic_check)
+        bar.addStretch(1)
         self.start_btn = QtWidgets.QPushButton("Start")
         self.start_btn.setCheckable(True)
+        self.start_btn.setMinimumWidth(110)
         self.start_btn.toggled.connect(self._toggle_engine)
         bar.addWidget(self.start_btn)
         root.addLayout(bar)
