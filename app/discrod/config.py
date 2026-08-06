@@ -38,6 +38,7 @@ class AppConfig:
     input_device: object = None       # PortAudio device index or name
     output_device: object = None      # should point at the virtual cable render
     monitor_device: object = None     # optional local monitoring output
+    monitor_mic: bool = False         # include processed mic in the monitor
     midi_port: str | None = None
     sample_rate: int = 48000
     block_size: int = 256
@@ -49,6 +50,7 @@ class AppConfig:
             "input_device": self.input_device,
             "output_device": self.output_device,
             "monitor_device": self.monitor_device,
+            "monitor_mic": self.monitor_mic,
             "midi_port": self.midi_port,
             "sample_rate": self.sample_rate,
             "block_size": self.block_size,
@@ -62,6 +64,7 @@ class AppConfig:
             input_device=data.get("input_device"),
             output_device=data.get("output_device"),
             monitor_device=data.get("monitor_device"),
+            monitor_mic=bool(data.get("monitor_mic", False)),
             midi_port=data.get("midi_port"),
             sample_rate=int(data.get("sample_rate", 48000)),
             block_size=int(data.get("block_size", 256)),

@@ -66,6 +66,9 @@ Full setup + troubleshooting: [`DEPLOY.md`](DEPLOY.md).
 - **Virtual microphone via signed cables, auto-detected** — VB-CABLE first,
   and the Steam Streaming Microphone, Elgato Wave Link, or VoiceMeeter if
   they're already installed. No custom kernel code anywhere in the product.
+- **Local monitoring** — pick a **Monitor** device (headphones) to hear the
+  soundboard at exactly the level it enters the virtual mic, and toggle
+  **Hear mic FX** (live, while running) to audition your gate/compressor/EQ.
 - **Device-robust audio I/O** — mono mics are upmixed automatically, sample
   rates are negotiated with the selected devices, and the mic ring buffer is
   primed and drift-bounded so long sessions neither crackle nor accumulate

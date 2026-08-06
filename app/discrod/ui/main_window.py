@@ -48,6 +48,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._build_ui()
         self._populate_devices()
+        self.hear_mic_check.setChecked(bool(self.cfg.monitor_mic))
         self._reload_pad_table()
         self._build_mixer()
         # Decode mapped clips up front so the first pad press never blocks the
@@ -74,12 +75,26 @@ class MainWindow(QtWidgets.QMainWindow):
         bar.addWidget(self.input_combo, 1)
         bar.addWidget(QtWidgets.QLabel("Virtual mic out:"))
         bar.addWidget(self.output_combo, 1)
+        self.monitor_combo = QtWidgets.QComboBox()
+        self.monitor_combo.setToolTip(
+            "Local monitoring output (headphones): hear the soundboard at\n"
+            "exactly the level it enters the virtual mic. Pick your\n"
+            "headphones here — not the virtual cable.")
+        bar.addWidget(QtWidgets.QLabel("Monitor:"))
+        bar.addWidget(self.monitor_combo, 1)
         bar.addWidget(QtWidgets.QLabel("MIDI:"))
         bar.addWidget(self.midi_combo, 1)
         self.refresh_btn = QtWidgets.QPushButton("⟳")
         self.refresh_btn.setToolTip("Rescan devices")
         self.refresh_btn.clicked.connect(self._populate_devices)
         bar.addWidget(self.refresh_btn)
+        self.hear_mic_check = QtWidgets.QCheckBox("Hear mic FX")
+        self.hear_mic_check.setToolTip(
+            "Include your processed microphone in the monitor output so you\n"
+            "can audition the gate/compressor/EQ. Use headphones — speakers\n"
+            "will feed back into the mic. Toggles live while running.")
+        self.hear_mic_check.toggled.connect(self._on_hear_mic_toggled)
+        bar.addWidget(self.hear_mic_check)
         self.start_btn = QtWidgets.QPushButton("Start")
         self.start_btn.setCheckable(True)
         self.start_btn.toggled.connect(self._toggle_engine)
@@ -180,6 +195,11 @@ class MainWindow(QtWidgets.QMainWindow):
         for idx, name, api in outputs:
             label = f"{name} [{api}]" if api else name
             self.output_combo.addItem(label, (idx, name, api))
+        self.monitor_combo.clear()
+        self.monitor_combo.addItem("(none)", None)
+        for idx, name, api in outputs:
+            label = f"{name} [{api}]" if api else name
+            self.monitor_combo.addItem(label, (idx, name, api))
         self.midi_combo.clear()
         self.midi_combo.addItem("(none)", None)
         for name in list_ports():
@@ -234,6 +254,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         select_audio(self.input_combo, self.cfg.input_device)
         select_audio(self.output_combo, self.cfg.output_device)
+        select_audio(self.monitor_combo, self.cfg.monitor_device)
         select_midi(self.midi_combo, self.cfg.midi_port)
         if self.cfg.output_device is None:
             self._auto_select_cable()
@@ -260,6 +281,10 @@ class MainWindow(QtWidgets.QMainWindow):
             15000)
 
     # --- engine -------------------------------------------------------------
+    def _on_hear_mic_toggled(self, on):
+        # Plain flag read by render_block each block — safe to flip live.
+        self.engine.monitor_mic = bool(on)
+
     def _toggle_engine(self, on):
         if on:
             def device_index(combo):
@@ -269,6 +294,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.engine.start(
                     input_device=device_index(self.input_combo),
                     output_device=device_index(self.output_combo),
+                    monitor_device=device_index(self.monitor_combo),
                 )
                 port = self.midi_combo.currentData()
                 if port:
@@ -474,6 +500,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.cfg.input_device = device_value(self.input_combo)
         self.cfg.output_device = device_value(self.output_combo)
+        self.cfg.monitor_device = device_value(self.monitor_combo)
+        self.cfg.monitor_mic = self.hear_mic_check.isChecked()
         self.cfg.midi_port = self.midi_combo.currentData()
         self.cfg.engine = self.engine.to_dict()
         self.cfg.bank = self.bank.to_dict()

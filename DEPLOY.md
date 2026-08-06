@@ -59,13 +59,17 @@ In the app's toolbar:
    your choice is saved.
 2. **Mic** → your real microphone (pick the *[WASAPI]* entry when offered —
    lowest latency; the app labels each device with its host API).
-3. **MIDI** → your keyboard/controller.
-4. Bind pads: **MIDI learn** → choose a clip → hit a key. Set each pad's mode
+3. **Monitor** (optional) → your headphones, to hear the soundboard at the
+   exact level Discord receives it. Tick **Hear mic FX** to also audition
+   your processed mic — headphones only, speakers will feed back into the
+   mic. The toggle works live while the engine runs.
+4. **MIDI** → your keyboard/controller.
+5. Bind pads: **MIDI learn** → choose a clip → hit a key. Set each pad's mode
    (one-shot / gate / loop / toggle), target channel, and gain in the table.
-5. Open **FX…** on the Microphone strip to enable/tune the gate, compressor,
+6. Open **FX…** on the Microphone strip to enable/tune the gate, compressor,
    and EQ. Suggested starting points for voice: gate threshold −45 dB,
    compressor −18 dB at 3:1, EQ flat.
-6. Press **Start**.
+7. Press **Start**.
 
 ## 3. Wire up Discord
 

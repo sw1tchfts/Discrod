@@ -63,6 +63,16 @@ class AudioEngine:
         self._max_fill = self._prime_frames * self.MAX_FILL_FACTOR
         self._mic_primed = False
 
+        # Local monitoring: a second output (headphones) fed the soundboard
+        # mix at exactly the level it enters the virtual mic, optionally
+        # including the processed mic (monitor_mic) to audition the FX chain.
+        # Same decoupling pattern as the mic: independent device clocks
+        # bridged by a primed, drift-bounded ring.
+        self.monitor_ring = RingBuffer(sample_rate, channels)
+        self.monitor_enabled = False
+        self.monitor_mic = False
+        self._monitor_primed = False
+
         # Default channels: a mic bus and a soundboard bus.
         self.mic_channel = Channel("Microphone", sample_rate, channels, KIND_MIC)
         self.soundboard_channel = Channel("Soundboard", sample_rate, channels,
@@ -79,8 +89,10 @@ class AudioEngine:
 
         self._input_stream = None
         self._output_stream = None
+        self._monitor_stream = None
         self.input_device = None
         self.output_device = None
+        self.monitor_device = None
         self.running = False
         # Invoked (from the thread calling start()) when device negotiation
         # changes the engine sample rate; clip caches must be invalidated.
@@ -107,6 +119,8 @@ class AudioEngine:
             ch.set_sample_rate(sample_rate)
         self.mic_ring = RingBuffer(sample_rate, self.channels)
         self._mic_primed = False
+        self.monitor_ring = RingBuffer(sample_rate, self.channels)
+        self._monitor_primed = False
         if self.on_sample_rate_changed is not None:
             self.on_sample_rate_changed(sample_rate)
 
@@ -182,6 +196,13 @@ class AudioEngine:
 
         any_solo = any(ch.solo for ch in self.channels_list)
 
+        # Monitor mix: the same processed channel blocks that feed the master,
+        # restricted to the soundboard buses (plus the mic when monitor_mic),
+        # so the headphone level tracks the virtual-mic level exactly.
+        monitor = None
+        if self.monitor_enabled:
+            monitor = np.zeros((frames, self.channels), dtype=np.float32)
+
         # Snapshot under the lock, render outside it: the DSP work below is the
         # expensive part and must not serialize against trigger_clip on the
         # UI/MIDI path (priority inversion into the audio callback).
@@ -200,6 +221,9 @@ class AudioEngine:
             if (not any_solo) or ch.solo:
                 if not ch.mute:
                     out += scratch
+                    if monitor is not None and (ch.kind != KIND_MIC
+                                                or self.monitor_mic):
+                        monitor += scratch
 
         # Drop finished voices.
         with self._voices_lock:
@@ -213,6 +237,13 @@ class AudioEngine:
         np.clip(out, -1.0, 1.0, out=out)
         if out.size:
             self.master_meter = float(np.max(np.abs(out)))
+        if monitor is not None:
+            # Mirror the master bus exactly (gain + clip) before handing the
+            # block to the monitor stream's ring.
+            if g != 1.0:
+                monitor *= g
+            np.clip(monitor, -1.0, 1.0, out=monitor)
+            self.monitor_ring.write(monitor)
         return out
 
     def _read_mic(self, frames: int) -> np.ndarray:
@@ -237,6 +268,27 @@ class AudioEngine:
             self._mic_primed = False
         return ring.read(frames)
 
+    def _read_monitor(self, frames: int) -> np.ndarray:
+        """Consume monitor frames — same priming/drift-bounding as the mic.
+
+        The monitor ring is written by the cable-output callback and drained
+        by the monitor device's callback; the two devices free-run on
+        independent clocks, so the identical prime/underrun/backlog-drop
+        treatment applies.
+        """
+        ring = self.monitor_ring
+        avail = ring.available
+        if not self._monitor_primed:
+            if avail < self._prime_frames:
+                return np.zeros((frames, self.channels), dtype=np.float32)
+            self._monitor_primed = True
+        if avail > self._max_fill:
+            ring.drop(avail - self._prime_frames)
+            avail = self._prime_frames
+        if avail < frames:
+            self._monitor_primed = False
+        return ring.read(frames)
+
     # --- PortAudio callbacks ------------------------------------------------
     def _input_callback(self, indata, frames, time_info, status):  # noqa: D401
         data = np.asarray(indata, dtype=np.float32)
@@ -253,28 +305,37 @@ class AudioEngine:
         block = self.render_block(frames)
         outdata[:] = block
 
+    def _monitor_callback(self, outdata, frames, time_info, status):
+        outdata[:] = self._read_monitor(frames)
+
     # --- lifecycle ----------------------------------------------------------
-    def start(self, input_device=None, output_device=None) -> None:
+    def start(self, input_device=None, output_device=None,
+              monitor_device=None) -> None:
         if sd is None:
             raise RuntimeError("sounddevice (PortAudio) is not available")
         if self.running:
             self.stop()
-        # Assign unconditionally: None means "no input" / "default output" for
-        # THIS start, never "keep whatever device a previous start used".
+        # Assign unconditionally: None means "no input" / "default output" /
+        # "no monitor" for THIS start, never "keep whatever device a previous
+        # start used".
         self.input_device = input_device
         self.output_device = output_device
+        self.monitor_device = monitor_device
         self._clear_voices()
 
         self.set_sample_rate(self._negotiate_sample_rate())
         in_channels = self._negotiated_input_channels()
         self.mic_ring.clear()
         self._mic_primed = False
+        self.monitor_ring.clear()
+        self._monitor_primed = False
 
-        # Construct both streams before starting either, and unwind on any
+        # Construct all streams before starting any, and unwind on any
         # failure — a half-started engine must not leak a live input stream
         # that keeps writing the ring behind our back.
         input_stream = None
         output_stream = None
+        monitor_stream = None
         try:
             if self.input_device is not None:
                 input_stream = sd.InputStream(
@@ -289,11 +350,24 @@ class AudioEngine:
                 dtype="float32", callback=self._output_callback,
                 latency="low",
             )
+            if self.monitor_device is not None:
+                monitor_stream = sd.OutputStream(
+                    device=self.monitor_device, samplerate=self.sample_rate,
+                    blocksize=self.block_size, channels=self.channels,
+                    dtype="float32", callback=self._monitor_callback,
+                    latency="low",
+                )
             if input_stream is not None:
                 input_stream.start()
+            # Flip monitor_enabled before the output stream runs so the very
+            # first rendered block reaches the monitor ring.
+            self.monitor_enabled = monitor_stream is not None
             output_stream.start()
+            if monitor_stream is not None:
+                monitor_stream.start()
         except Exception:
-            for stream in (input_stream, output_stream):
+            self.monitor_enabled = False
+            for stream in (input_stream, output_stream, monitor_stream):
                 if stream is not None:
                     try:
                         stream.stop()
@@ -303,6 +377,7 @@ class AudioEngine:
             raise
         self._input_stream = input_stream
         self._output_stream = output_stream
+        self._monitor_stream = monitor_stream
         self.running = True
 
     def _negotiate_sample_rate(self) -> int:
@@ -332,6 +407,10 @@ class AudioEngine:
                         device=self.input_device, samplerate=candidate,
                         channels=self._negotiated_input_channels(),
                         dtype="float32")
+                if self.monitor_device is not None:
+                    sd.check_output_settings(
+                        device=self.monitor_device, samplerate=candidate,
+                        channels=self.channels, dtype="float32")
                 return candidate
             except Exception:
                 continue
@@ -351,7 +430,9 @@ class AudioEngine:
 
     def stop(self) -> None:
         self.running = False
-        for stream in (self._input_stream, self._output_stream):
+        self.monitor_enabled = False
+        for stream in (self._input_stream, self._output_stream,
+                       self._monitor_stream):
             if stream is not None:
                 try:
                     stream.stop()
@@ -360,6 +441,7 @@ class AudioEngine:
                     pass
         self._input_stream = None
         self._output_stream = None
+        self._monitor_stream = None
 
     # --- config -------------------------------------------------------------
     def to_dict(self) -> dict:
